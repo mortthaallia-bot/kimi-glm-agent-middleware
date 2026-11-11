@@ -1,0 +1,43 @@
+{
+  "name": "doai-proxy",
+  "version": "1.0.0",
+  "description": "DOAI Proxy - Definitely OpenAI (it's definitely not). OpenAI-compatible proxy with streaming and tool calling for providers that lack them.",
+  "license": "MIT",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test __tests__/",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.55.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ManningWorks/DOAI-Proxy.git"
+  },
+  "homepage": "https://doai-proxy.manningworks.dev",
+  "bugs": {
+    "url": "https://github.com/ManningWorks/DOAI-Proxy/issues"
+  },
+  "keywords": [
+    "openai",
+    "proxy",
+    "api",
+    "streaming",
+    "function-calling",
+    "straico",
+    "ai"
+  ]
+}

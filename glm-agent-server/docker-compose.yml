@@ -1,0 +1,18 @@
+services:
+  doai-proxy:
+    build: .
+    container_name: doai-proxy
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env:ro
+      - ${HOME}/.config/opencode:/home/node/.config/opencode
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

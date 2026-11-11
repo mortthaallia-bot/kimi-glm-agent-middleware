@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment variables & sensitive keys
+.env
+.env.local
+*.log
+logs/
+
+# Cache & Temporary files
+.video_frames/
+attachments/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,27 @@
+{
+  "name": "kimi-glm-agent-middleware",
+  "version": "1.0.0",
+  "description": "Production-grade autonomous agent middleware converting Kimi and GLM into full-capability coding, video & research agents with live tool interception, vision analysis, and 24/7 watchdog.",
+  "scripts": {
+    "start": "node watchdog/watchdog.js",
+    "watchdog": "node watchdog/watchdog.js",
+    "kimi": "cd kimi-agent-server && node server.js",
+    "glm": "cd glm-agent-server && node server.js",
+    "zai": "cd zai-proxy && node server.js",
+    "install:all": "npm install --prefix kimi-agent-server && npm install --prefix glm-agent-server && npm install --prefix zai-proxy"
+  },
+  "keywords": [
+    "kimi",
+    "glm",
+    "agent",
+    "middleware",
+    "hermes-agent",
+    "opencode",
+    "tool-injection",
+    "stream-interception",
+    "vision",
+    "video-inspection"
+  ],
+  "author": "mortthaallia-bot",
+  "license": "MIT"
+}
