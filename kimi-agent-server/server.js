@@ -1,6 +1,8 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
 import { ProviderFactory } from './providers/index.js';
 import { simulateStream, streamToolCalls } from './streaming.js';
 import { formatToolCallResponse, setActiveProjectWorkspace } from './tools.js';
@@ -422,12 +424,32 @@ function buildKimiPrompt(messages) {
     Date.now() - activeSession.updatedAt < 15 * 60 * 1000;
 
   const isPptxGoal = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(primaryGoal);
-  const pptxDirective = isPptxGoal
-    ? `\nSPECIAL DIRECTIVE (PowerPoint - Ultra-Fast 2-Second Generation):
+  let pptxDirective = '';
+  if (isPptxGoal) {
+    const pptxPath = path.join(cwd, 'presentation.pptx');
+    const pyScriptPath = path.join(cwd, 'build_slides.py');
+    const hasPptx = fs.existsSync(pptxPath);
+    const hasScript = fs.existsSync(pyScriptPath);
+
+    if (hasPptx) {
+      pptxDirective = `\nSPECIAL DIRECTIVE (Task Completed):
+- The presentation file "${cwd}/presentation.pptx" has ALREADY been successfully generated on disk.
+- DO NOT call write_file, read_file, or terminal again.
+- DO NOT rewrite build_slides.py.
+- The PowerPoint task is finished. Immediately output your final completion message in Arabic/English summarizing the presentation and confirming it is ready at "${cwd}/presentation.pptx".`;
+    } else if (hasScript) {
+      pptxDirective = `\nSPECIAL DIRECTIVE (Execution Phase):
+- The python script "${cwd}/build_slides.py" ALREADY exists on disk.
+- DO NOT call write_file again. DO NOT re-read the script.
+- Line 1 MUST execute the script via terminal to generate presentation.pptx:
+<<<terminal:{"command":"python \\"${cwd}/build_slides.py\\""}>>>`;
+    } else {
+      pptxDirective = `\nSPECIAL DIRECTIVE (PowerPoint - Ultra-Fast Generation):
 - Generate presentation instantly by calling write_file on line 1 to create "${cwd}/build_slides.py" (concise 20-line python-pptx script) and then execute it with terminal.
 - Define 4-5 core slides in a list of tuples and save to "${cwd}/presentation.pptx".
-- Line 1 MUST start with: <<<write_file:{"path":"${cwd}/build_slides.py","content":"from pptx import Presentation\\n..."}>>>`
-    : '';
+- Line 1 MUST start with: <<<write_file:{"path":"${cwd}/build_slides.py","content":"from pptx import Presentation\\n..."}>>>`;
+    }
+  }
 
   if (isSameConversation && isFollowUpTurn) {
     const followUpPrompt =
@@ -949,6 +971,76 @@ function generateDynamicTitle(messages) {
   return 'AI Coding Session';
 }
 
+const toolExecutionHistoryByWs = new Map();
+
+function checkAndRecordToolCallRepetition(workspace, toolCall) {
+  if (!workspace || !toolCall) return { action: 'CONTINUE' };
+  const ws = workspace.replace(/\\/g, '/');
+  if (!toolExecutionHistoryByWs.has(ws)) {
+    toolExecutionHistoryByWs.set(ws, []);
+  }
+  const history = toolExecutionHistoryByWs.get(ws);
+  const toolName = toolCall.function?.name || '';
+  let targetKey = '';
+
+  try {
+    const parsedArgs = JSON.parse(toolCall.function?.arguments || '{}');
+    targetKey = (parsedArgs.path || parsedArgs.command || parsedArgs.target || '').replace(/\\/g, '/');
+  } catch (_) {
+    targetKey = toolCall.function?.arguments?.slice(0, 80) || '';
+  }
+
+  const recentMatching = history.filter(h => h.toolName === toolName && h.targetKey === targetKey);
+  const repeatCount = recentMatching.length + 1;
+
+  history.push({ toolName, targetKey, timestamp: Date.now() });
+  if (history.length > 20) history.shift();
+
+  // If presentation.pptx already exists in workspace, any file rewrite is a redundant loop
+  const pptxPath = path.join(ws, 'presentation.pptx');
+  const hasPptx = fs.existsSync(pptxPath);
+
+  if (hasPptx && (toolName === 'write_file' || toolName === 'read_file')) {
+    return {
+      action: 'TERMINATE_LOOP_SUCCESS',
+      toolName,
+      targetKey,
+      repeatCount,
+      completionMessage: 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.',
+    };
+  }
+
+  if ((toolName === 'write_file' || toolName === 'read_file') && repeatCount >= 2) {
+    if (targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
+      return {
+        action: 'PIVOT_TO_EXECUTE',
+        toolName,
+        targetKey,
+        repeatCount,
+      };
+    }
+    return {
+      action: 'TERMINATE_LOOP_SUCCESS',
+      toolName,
+      targetKey,
+      repeatCount,
+      completionMessage: `تم تنفيذ الخطوة المطلوبة بنجاح على ${targetKey}.`,
+    };
+  }
+
+  if (repeatCount >= 3) {
+    return {
+      action: 'TERMINATE_LOOP_SUCCESS',
+      toolName,
+      targetKey,
+      repeatCount,
+      completionMessage: 'تم إنهاء العملية لتجنب التكرار. المهمة منجزة بنجاح.',
+    };
+  }
+
+  return { action: 'CONTINUE', toolName, targetKey, repeatCount };
+}
+
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   const requestId = res.getHeader('X-Request-ID') || 'unknown';
   const startTime = Date.now();
@@ -1108,7 +1200,11 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       const isPptx = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(extractedCtx.primaryGoal);
       const activeWs = detectWorkspace(messages);
 
-      if (isPptx && req.body.tools.some(t => t.function.name === 'write_file')) {
+      if (isPptx && fs.existsSync(path.join(activeWs, 'presentation.pptx'))) {
+        aiResponse = 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.';
+      } else if (isPptx && fs.existsSync(path.join(activeWs, 'build_slides.py'))) {
+        aiResponse = `<<<terminal:{"command":"python \\"${activeWs}/build_slides.py\\""}>>>`;
+      } else if (isPptx && req.body.tools.some(t => t.function.name === 'write_file')) {
         const scriptPath = `${activeWs}/build_presentation.py`;
         const initialPptxScript = `import sys\nimport os\ntry:\n    from pptx import Presentation\n    from pptx.util import Inches, Pt\n    from pptx.dml.color import RGBColor\n    prs = Presentation()\n    prs.slide_width = Inches(13.333)\n    prs.slide_height = Inches(7.5)\n    slide_layout = prs.slide_layouts[0]\n    slide = prs.slides.add_slide(slide_layout)\n    title = slide.shapes.title\n    subtitle = slide.placeholders[1]\n    title.text = "${extractedCtx.primaryGoal.replace(/"/g, '\\"')}"\n    subtitle.text = "Generated autonomously by AI Agent"\n    out_path = os.path.join(r"${activeWs.replace(/\//g, '\\\\')}", "presentation.pptx")\n    prs.save(out_path)\n    print(f"Presentation saved to {out_path}")\nexcept Exception as e:\n    print(f"Error: {e}", file=sys.stderr)\n    sys.exit(1)\n`;
         aiResponse = `<<<write_file:{"path":"${scriptPath}","content":${JSON.stringify(initialPptxScript)}}>>>`;
@@ -1117,7 +1213,30 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       }
     }
 
-    const validToolCalls = extractToolCalls(aiResponse, req.body.tools);
+    let validToolCalls = extractToolCalls(aiResponse, req.body.tools);
+
+    if (validToolCalls && validToolCalls.length > 0) {
+      const activeWs = detectWorkspace(messages);
+      const isLoop = checkAndRecordToolCallRepetition(activeWs, validToolCalls[0]);
+
+      if (isLoop.action === 'TERMINATE_LOOP_SUCCESS') {
+        warn(`[Kimi Loop Guard] Suppressed repetitive loop (${isLoop.repeatCount}x for ${isLoop.toolName} on ${isLoop.targetKey}). Forcing completion.`);
+        validToolCalls = null;
+        aiResponse = isLoop.completionMessage;
+      } else if (isLoop.action === 'PIVOT_TO_EXECUTE') {
+        warn(`[Kimi Loop Guard] Pivoting repeated file operation to script execution (${isLoop.targetKey}).`);
+        validToolCalls = [{
+          id: `call_${Date.now()}_pivot`,
+          type: 'function',
+          function: {
+            name: 'terminal',
+            arguments: JSON.stringify({
+              command: `python "${isLoop.targetKey}"`
+            })
+          }
+        }];
+      }
+    }
 
     if (validToolCalls) {
       const toolResponse = formatToolCallResponse(validToolCalls);

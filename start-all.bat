@@ -1,6 +1,6 @@
 @echo off
 title Kimi & GLM Agent Middleware - 24/7 Watchdog
-cd /d "%~dp0\.."
+cd /d "%~dp0"
 
 echo ========================================================
 echo   Starting Kimi & GLM Autonomous Agent Middleware

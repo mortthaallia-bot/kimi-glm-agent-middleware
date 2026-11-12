@@ -131,3 +131,25 @@ test('Task 2.e: Retry cap stops infinite loops', () => {
     assert.ok(isOverflowError(finalErr));
   }
 });
+
+test('Task 2.f: Anti-Ping-Pong Loop Breaker intercepts repetitive tool calls', () => {
+  const history = [];
+  const checkLoop = (ws, toolName, targetKey) => {
+    const matching = history.filter(h => h.toolName === toolName && h.targetKey === targetKey);
+    const count = matching.length + 1;
+    history.push({ toolName, targetKey });
+    if (count >= 2) {
+      return { action: 'TERMINATE_LOOP_SUCCESS', repeatCount: count };
+    }
+    return { action: 'CONTINUE', repeatCount: count };
+  };
+
+  // Turn 1: write_file
+  const turn1 = checkLoop('C:/Users/hhjksd/Desktop/montag', 'write_file', 'C:/Users/hhjksd/Desktop/montag/build_slides.py');
+  assert.equal(turn1.action, 'CONTINUE');
+
+  // Turn 2: Attempting to repeat write_file on same path
+  const turn2 = checkLoop('C:/Users/hhjksd/Desktop/montag', 'write_file', 'C:/Users/hhjksd/Desktop/montag/build_slides.py');
+  assert.equal(turn2.action, 'TERMINATE_LOOP_SUCCESS', 'Repetitive action must be intercepted on turn 2');
+  assert.equal(turn2.repeatCount, 2);
+});

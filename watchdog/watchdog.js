@@ -1,7 +1,28 @@
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+
+function freePorts(ports) {
+  if (!ports || !Array.isArray(ports)) return;
+  for (const port of ports) {
+    try {
+      if (process.platform === 'win32') {
+        const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        const lines = out.split('\n');
+        for (const line of lines) {
+          if (line.includes('LISTENING')) {
+            const parts = line.trim().split(/\s+/);
+            const pid = parts[parts.length - 1];
+            if (pid && pid !== '0' && Number(pid) !== process.pid) {
+              execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' });
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+}
 
 const WATCHDOG_PORT = parseInt(process.env.WATCHDOG_PORT || '8099', 10);
 const NODE_EXE = process.execPath || 'node';
@@ -79,6 +100,8 @@ function startService(svc) {
   if (svc.child && !svc.child.killed) {
     return;
   }
+
+  freePorts(svc.ports);
 
   logWatchdog(`Starting service ${svc.name} in ${svc.cwd}...`);
   const logFile = path.join(LOG_DIR, `${svc.name}.log`);
