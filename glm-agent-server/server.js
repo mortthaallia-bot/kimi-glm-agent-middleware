@@ -173,20 +173,6 @@ function checkAndRecordToolCallRepetition(workspace, toolCall) {
   history.push({ toolName, targetKey, timestamp: Date.now() });
   if (history.length > 20) history.shift();
 
-  // If presentation.pptx already exists in workspace, any rewrite of the generator is redundant
-  const pptxPath = path.join(ws, 'presentation.pptx');
-  const hasPptx = fs.existsSync(pptxPath);
-
-  if (hasPptx && (toolName === 'write_file' || toolName === 'read_file')) {
-    return {
-      action: 'TERMINATE_LOOP_SUCCESS',
-      toolName,
-      targetKey,
-      consecutiveCount,
-      completionMessage: 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.',
-    };
-  }
-
   if (consecutiveCount >= 3) {
     if (toolName === 'write_file' && targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
       return {

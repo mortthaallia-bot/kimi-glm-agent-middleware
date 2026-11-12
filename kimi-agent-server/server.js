@@ -423,34 +423,6 @@ function buildKimiPrompt(messages) {
     Boolean(activeSession.lastMsgId) &&
     activeSession.firstUserHash === firstUserHash;
 
-  const isPptxGoal = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(primaryGoal);
-  let pptxDirective = '';
-  if (isPptxGoal) {
-    const pptxPath = path.join(cwd, 'presentation.pptx');
-    const pyScriptPath = path.join(cwd, 'build_slides.py');
-    const hasPptx = fs.existsSync(pptxPath);
-    const hasScript = fs.existsSync(pyScriptPath);
-
-    if (hasPptx) {
-      pptxDirective = `\nSPECIAL DIRECTIVE (Task Completed):
-- The presentation file "${cwd}/presentation.pptx" ALREADY exists on disk.
-- DO NOT call write_file, read_file, or terminal again.
-- DO NOT rewrite build_slides.py.
-- The PowerPoint task is finished. Immediately output your final completion message in Arabic/English summarizing the presentation and confirming it is ready at "${cwd}/presentation.pptx".`;
-    } else if (hasScript) {
-      pptxDirective = `\nSPECIAL DIRECTIVE (Execution Phase):
-- The python script "${cwd}/build_slides.py" ALREADY exists on disk.
-- DO NOT call write_file again. DO NOT re-read the script.
-- Line 1 MUST execute the script via terminal to generate presentation.pptx:
-<<<terminal:{"command":"python \\"${cwd}/build_slides.py\\""}>>>`;
-    } else {
-      pptxDirective = `\nSPECIAL DIRECTIVE (PowerPoint - Ultra-Fast Generation):
-- Generate presentation instantly by calling write_file on line 1 to create "${cwd}/build_slides.py" (concise 20-line python-pptx script) and then execute it with terminal.
-- Define 4-5 core slides in a list of tuples and save to "${cwd}/presentation.pptx".
-- Line 1 MUST start with: <<<write_file:{"path":"${cwd}/build_slides.py","content":"from pptx import Presentation\\n..."}>>>`;
-    }
-  }
-
   if (isSameConversation && isFollowUpTurn) {
     const followUpPrompt =
 `[CONTINUATION - ACTIVE AUTONOMOUS SESSION]
@@ -459,13 +431,12 @@ ACTIVE WORKSPACE: ${cwd}
 ${historySummary ? `RECENT PROGRESS:\n${historySummary}\n` : ''}
 LATEST EVENT / TOOL OUTPUT:
 ${lastText}
-${pptxDirective}
 INSTRUCTION:
-Review the latest tool result above and execute the NEXT logical step to fulfill the PRIMARY USER GOAL.
-- DO NOT repeat, rewrite, or re-read files that have already succeeded. Move forward to the next step.
-- If a script has been written, execute it with terminal.
-- If the final output file (such as presentation.pptx) is ready, conclude immediately with a clear summary.
-- NEVER ask passive conversational questions like "How can I help you?". Output the next required tool call on line 1.`;
+Review the user's PRIMARY USER GOAL and the latest tool result above.
+Execute the NEXT logical step to fulfill the user's goal completely.
+- Inspect, read, or process whatever files or sources the user specified (e.g. PDF documents, images, scripts).
+- Write, modify, or run code as necessary to produce the final deliverable.
+- NEVER ask passive conversational questions like "How can I help you?". Output ONLY the next required tool call on line 1.`;
 
     return {
       promptText: followUpPrompt,
@@ -487,9 +458,9 @@ ${cwd}
 ${historySummary ? `\nRECENT PROGRESS:\n${historySummary}\n` : ''}
 LATEST TOOL RESULT:
 ${lastText}
-${pptxDirective}
 INSTRUCTION:
-The workspace has been inspected or action executed. You are an autonomous agent. Do NOT ask conversational questions like "How can I help you?". Immediately output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
+The workspace has been inspected or action executed. You are an autonomous agent.
+Do NOT ask conversational questions like "How can I help you?". Immediately output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
   } else {
     promptBody =
 `PRIMARY USER GOAL:
@@ -497,9 +468,9 @@ ${primaryGoal}
 
 ACTIVE WORKSPACE:
 ${cwd}
-${pptxDirective}
 INSTRUCTION:
-You are an autonomous agent. Begin executing the task immediately. Output ONLY the tool call on line 1:`;
+You are an autonomous agent with the capabilities of Antigravity.
+Begin executing the task immediately based on the PRIMARY USER GOAL. Inspect workspace files, read sources/images, and output ONLY the tool call on line 1:`;
   }
 
   const microPrompt =
@@ -1008,20 +979,6 @@ function checkAndRecordToolCallRepetition(workspace, toolCall) {
   history.push({ toolName, targetKey, timestamp: Date.now() });
   if (history.length > 20) history.shift();
 
-  // If presentation.pptx already exists in workspace, any rewrite of the generator is redundant
-  const pptxPath = path.join(ws, 'presentation.pptx');
-  const hasPptx = fs.existsSync(pptxPath);
-
-  if (hasPptx && (toolName === 'write_file' || toolName === 'read_file')) {
-    return {
-      action: 'TERMINATE_LOOP_SUCCESS',
-      toolName,
-      targetKey,
-      consecutiveCount,
-      completionMessage: 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.',
-    };
-  }
-
   // Only block if the exact same tool call was made consecutively 3+ times with zero progress
   if (consecutiveCount >= 3) {
     if (toolName === 'write_file' && targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
@@ -1194,11 +1151,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       const isPptx = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(extractedCtx.primaryGoal);
       const activeWs = detectWorkspace(messages);
 
-      if (isPptx && fs.existsSync(path.join(activeWs, 'presentation.pptx'))) {
-        aiResponse = 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.';
-      } else if (isPptx && fs.existsSync(path.join(activeWs, 'build_slides.py'))) {
-        aiResponse = `<<<terminal:{"command":"python \\"${activeWs}/build_slides.py\\""}>>>`;
-      } else if (isPptx && req.body.tools.some(t => t.function.name === 'write_file')) {
+      if (isPptx && req.body.tools.some(t => t.function.name === 'write_file')) {
         const scriptPath = `${activeWs}/build_presentation.py`;
         const initialPptxScript = `import sys\nimport os\ntry:\n    from pptx import Presentation\n    from pptx.util import Inches, Pt\n    from pptx.dml.color import RGBColor\n    prs = Presentation()\n    prs.slide_width = Inches(13.333)\n    prs.slide_height = Inches(7.5)\n    slide_layout = prs.slide_layouts[0]\n    slide = prs.slides.add_slide(slide_layout)\n    title = slide.shapes.title\n    subtitle = slide.placeholders[1]\n    title.text = "${extractedCtx.primaryGoal.replace(/"/g, '\\"')}"\n    subtitle.text = "Generated autonomously by AI Agent"\n    out_path = os.path.join(r"${activeWs.replace(/\//g, '\\\\')}", "presentation.pptx")\n    prs.save(out_path)\n    print(f"Presentation saved to {out_path}")\nexcept Exception as e:\n    print(f"Error: {e}", file=sys.stderr)\n    sys.exit(1)\n`;
         aiResponse = `<<<write_file:{"path":"${scriptPath}","content":${JSON.stringify(initialPptxScript)}}>>>`;
