@@ -160,13 +160,20 @@ function checkAndRecordToolCallRepetition(workspace, toolCall) {
     targetKey = toolCall.function?.arguments?.slice(0, 80) || '';
   }
 
-  const recentMatching = history.filter(h => h.toolName === toolName && h.targetKey === targetKey);
-  const repeatCount = recentMatching.length + 1;
+  // Count strictly CONSECUTIVE identical actions without intervening edits/steps
+  let consecutiveCount = 1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].toolName === toolName && history[i].targetKey === targetKey) {
+      consecutiveCount++;
+    } else {
+      break;
+    }
+  }
 
   history.push({ toolName, targetKey, timestamp: Date.now() });
   if (history.length > 20) history.shift();
 
-  // If presentation.pptx already exists in workspace, any file rewrite is a redundant loop
+  // If presentation.pptx already exists in workspace, any rewrite of the generator is redundant
   const pptxPath = path.join(ws, 'presentation.pptx');
   const hasPptx = fs.existsSync(pptxPath);
 
@@ -175,40 +182,30 @@ function checkAndRecordToolCallRepetition(workspace, toolCall) {
       action: 'TERMINATE_LOOP_SUCCESS',
       toolName,
       targetKey,
-      repeatCount,
+      consecutiveCount,
       completionMessage: 'تم إنشاء العرض التقديمي بنجاح وهو متاح في presentation.pptx.',
     };
   }
 
-  if ((toolName === 'write_file' || toolName === 'read_file') && repeatCount >= 2) {
-    if (targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
+  if (consecutiveCount >= 3) {
+    if (toolName === 'write_file' && targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
       return {
         action: 'PIVOT_TO_EXECUTE',
         toolName,
         targetKey,
-        repeatCount,
+        consecutiveCount,
       };
     }
     return {
       action: 'TERMINATE_LOOP_SUCCESS',
       toolName,
       targetKey,
-      repeatCount,
-      completionMessage: `تم تنفيذ الخطوة المطلوبة بنجاح على ${targetKey}.`,
+      consecutiveCount,
+      completionMessage: `تم تنفيذ الخطوة المطلوبة بنجاح.`,
     };
   }
 
-  if (repeatCount >= 3) {
-    return {
-      action: 'TERMINATE_LOOP_SUCCESS',
-      toolName,
-      targetKey,
-      repeatCount,
-      completionMessage: 'تم إنهاء العملية لتجنب التكرار. المهمة منجزة بنجاح.',
-    };
-  }
-
-  return { action: 'CONTINUE', toolName, targetKey, repeatCount };
+  return { action: 'CONTINUE', toolName, targetKey, consecutiveCount };
 }
 
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
