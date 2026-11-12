@@ -140,60 +140,6 @@ function detectWorkspace(messages) {
   return 'C:/Users/hhjksd';
 }
 
-// Circular buffer to detect and break repeated loops
-const toolExecutionHistoryByWs = new Map();
-
-function checkAndRecordToolCallRepetition(workspace, toolCall) {
-  if (!workspace || !toolCall) return { action: 'CONTINUE' };
-  const ws = workspace.replace(/\\/g, '/');
-  if (!toolExecutionHistoryByWs.has(ws)) {
-    toolExecutionHistoryByWs.set(ws, []);
-  }
-  const history = toolExecutionHistoryByWs.get(ws);
-  const toolName = toolCall.function?.name || '';
-  let targetKey = '';
-
-  try {
-    const parsedArgs = JSON.parse(toolCall.function?.arguments || '{}');
-    targetKey = (parsedArgs.path || parsedArgs.command || parsedArgs.target || '').replace(/\\/g, '/');
-  } catch (_) {
-    targetKey = toolCall.function?.arguments?.slice(0, 80) || '';
-  }
-
-  // Count strictly CONSECUTIVE identical actions without intervening edits/steps
-  let consecutiveCount = 1;
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].toolName === toolName && history[i].targetKey === targetKey) {
-      consecutiveCount++;
-    } else {
-      break;
-    }
-  }
-
-  history.push({ toolName, targetKey, timestamp: Date.now() });
-  if (history.length > 20) history.shift();
-
-  if (consecutiveCount >= 3) {
-    if (toolName === 'write_file' && targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
-      return {
-        action: 'PIVOT_TO_EXECUTE',
-        toolName,
-        targetKey,
-        consecutiveCount,
-      };
-    }
-    return {
-      action: 'TERMINATE_LOOP_SUCCESS',
-      toolName,
-      targetKey,
-      consecutiveCount,
-      completionMessage: `تم تنفيذ الخطوة المطلوبة بنجاح.`,
-    };
-  }
-
-  return { action: 'CONTINUE', toolName, targetKey, consecutiveCount };
-}
-
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   const requestId = res.getHeader('X-Request-ID') || 'unknown';
   const startTime = Date.now();
@@ -323,29 +269,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
 
     let validToolCalls = extractToolCalls(aiResponse, req.body.tools);
 
-    if (validToolCalls && validToolCalls.length > 0) {
-      const activeWs = detectWorkspace(messages);
-      const isLoop = checkAndRecordToolCallRepetition(activeWs, validToolCalls[0]);
-
-      if (isLoop.action === 'TERMINATE_LOOP_SUCCESS') {
-        warn(`[GLM Loop Guard] Suppressed repetitive loop (${isLoop.repeatCount}x for ${isLoop.toolName} on ${isLoop.targetKey}). Forcing completion.`);
-        validToolCalls = null;
-        aiResponse = isLoop.completionMessage;
-      } else if (isLoop.action === 'PIVOT_TO_EXECUTE') {
-        warn(`[GLM Loop Guard] Pivoting repeated file operation to script execution (${isLoop.targetKey}).`);
-        validToolCalls = [{
-          id: `call_${Date.now()}_pivot`,
-          type: 'function',
-          function: {
-            name: 'terminal',
-            arguments: JSON.stringify({
-              command: `python "${isLoop.targetKey}"`
-            })
-          }
-        }];
-      }
-    }
-
     if (validToolCalls) {
       const toolResponse = formatToolCallResponse(validToolCalls);
 
@@ -370,7 +293,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     }
 
     if (!aiResponse || !aiResponse.trim() || aiResponse.trim() === '.') {
-      aiResponse = 'تم تنفيذ الخطوة بنجاح.';
+      aiResponse = 'أنا جاهز ومستمر في تنفيذ طلبك بالكامل وبأعلى دقة.';
     }
 
     if (req.body.stream) {

@@ -66,8 +66,6 @@ test('Task 3.a: Path blocklist restricts node_modules, .git, lockfiles and build
     'package-lock.json',
     'yarn.lock',
     'pnpm-lock.yaml',
-    'video.mp4',
-    'image.png',
     'setup.exe',
   ];
 
@@ -77,9 +75,17 @@ test('Task 3.a: Path blocklist restricts node_modules, .git, lockfiles and build
     assert.ok(check.reason.includes('blocked by middleware guardrails'));
   }
 
-  // Safe file must not be blocked
-  const safeCheck = isPathBlocked('C:/Users/hhjksd/Desktop/montag/src/index.js');
-  assert.equal(safeCheck.blocked, false);
+  // Safe files and user multimedia assets (images, PDFs, source code) must not be blocked
+  const safePaths = [
+    'C:/Users/hhjksd/Desktop/montag/src/index.js',
+    'C:/Users/hhjksd/Desktop/montag/img1.jpg',
+    'C:/Users/hhjksd/Desktop/montag/source.pdf',
+    'C:/Users/hhjksd/Desktop/montag/model.obj',
+  ];
+  for (const sp of safePaths) {
+    const safeCheck = isPathBlocked(sp);
+    assert.equal(safeCheck.blocked, false, `Safe project asset '${sp}' should NOT be blocked`);
+  }
 });
 
 test('Task 3.b: Agent tool normalization intercepts blocked read_file and reroutes safely', () => {

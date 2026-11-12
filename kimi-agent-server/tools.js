@@ -19,9 +19,6 @@ export const BLOCKED_PATH_PATTERNS = [
   /(?:^|[\\/])remotion[\\/](?:build|bundle|dist|out)(?:[\\/]|$)/i,
   /(?:^|[\\/])(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb)$/i,
   /\.(?:exe|dll|so|dylib|bin|iso|zip|tar|gz|7z)$/i,
-  /\.(?:mp4|mov|avi|mkv|webm|flv|wmv)$/i,
-  /\.(?:jpg|jpeg|png|gif|webp|svg|ico)$/i,
-  /\.(?:mp3|wav|ogg|aac|flac)$/i,
 ];
 
 export function isPathBlocked(filePath) {

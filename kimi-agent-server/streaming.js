@@ -26,7 +26,7 @@ async function simulateStreamNone(responseText, res) {
   }
 
   const streamId = `chatcmpl-${Date.now()}`;
-  const safeText = responseText.trim() ? responseText : 'تم تنفيذ الخطوة بنجاح.';
+  const safeText = responseText.trim() ? responseText : '';
 
   const sseData = {
     id: streamId,
@@ -65,7 +65,7 @@ async function simulateStreamSmart(responseText, res, chunkSize = 15, delay = 80
   }
 
   const streamId = `chatcmpl-${Date.now()}`;
-  const safeText = responseText.trim() ? responseText : 'تم تنفيذ الخطوة بنجاح.';
+  const safeText = responseText.trim() ? responseText : '';
 
   const chunks = smartChunkText(safeText, chunkSize);
 

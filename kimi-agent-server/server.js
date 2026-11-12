@@ -374,7 +374,7 @@ function extractGoalAndContext(messages) {
   };
 }
 
-function buildKimiPrompt(messages) {
+function buildKimiPrompt(messages, availableTools = []) {
   // Purge any leaked session_title artifacts from message history
   const cleanMessages = (messages || []).filter(m => {
     if (m.role === 'assistant' && typeof m.content === 'string') {
@@ -432,11 +432,11 @@ ${historySummary ? `RECENT PROGRESS:\n${historySummary}\n` : ''}
 LATEST EVENT / TOOL OUTPUT:
 ${lastText}
 INSTRUCTION:
-Review the user's PRIMARY USER GOAL and the latest tool result above.
+Review the user's PRIMARY USER GOAL and the latest tool output.
 Execute the NEXT logical step to fulfill the user's goal completely.
-- Inspect, read, or process whatever files or sources the user specified (e.g. PDF documents, images, scripts).
-- Write, modify, or run code as necessary to produce the final deliverable.
-- NEVER ask passive conversational questions like "How can I help you?". Output ONLY the next required tool call on line 1.`;
+- Inspect and read source files (PDFs, images, data, code) as needed.
+- Write, patch, or run code (Python, 3D generators, PowerPoint, scripts, CLI tools).
+- Output the next tool call on line 1, or output your complete, thoughtful final response.`;
 
     return {
       promptText: followUpPrompt,
@@ -459,8 +459,8 @@ ${historySummary ? `\nRECENT PROGRESS:\n${historySummary}\n` : ''}
 LATEST TOOL RESULT:
 ${lastText}
 INSTRUCTION:
-The workspace has been inspected or action executed. You are an autonomous agent.
-Do NOT ask conversational questions like "How can I help you?". Immediately output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
+The workspace has been inspected or action executed. You are an autonomous agent with full machine access.
+Output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
   } else {
     promptBody =
 `PRIMARY USER GOAL:
@@ -469,36 +469,44 @@ ${primaryGoal}
 ACTIVE WORKSPACE:
 ${cwd}
 INSTRUCTION:
-You are an autonomous agent with the capabilities of Antigravity.
+You are an autonomous agent with the full capabilities of Antigravity.
 Begin executing the task immediately based on the PRIMARY USER GOAL. Inspect workspace files, read sources/images, and output ONLY the tool call on line 1:`;
   }
 
-  const microPrompt =
-`[Bridge Protocol: Local client-side parser on user's PC executes tool calls and returns their output. Do NOT use Kimi's built-in cloud tools.]
-SYSTEM: Autonomous Principal Systems & Software Engineer (Antigravity-Grade Agent).
-Active Workspace: ${cwd}
-File System: Unrestricted full read/write access across all drives and paths.
-
-AUTONOMOUS AGENT CAPABILITIES & RULES:
-1. Proactive Autonomy: NEVER ask passive questions like "How can I help you?", "The directory is empty, what should I do?", or "Should I proceed?". An empty directory is normal for a new project. IMMEDIATELY proceed to create files, write code/scripts, and complete the goal.
-2. Fast & Direct Tool Calling: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}). NEVER output conversational filler or greetings before the tool call.
-3. Complete Production Artifacts: Create complete, working files directly.
-4. Verification & Completion: When the entire task is 100% finished and verified on disk, provide a clear, professional Arabic/English final summary detailing the files created and how to use them.
-
-Tools:
-- terminal({"command":"..."}) [POSIX bash syntax, forward slashes /, runs in active workspace or user directory]
-- read_file({"path":"...", "offset":1, "limit":200}) [Can read ANY absolute or relative path across the entire disk]
-- write_file({"path":"...", "content":"..."}) [Can create or overwrite ANY file across the disk]
+  const formattedTools = (availableTools && Array.isArray(availableTools) && availableTools.length > 0)
+    ? availableTools.map(t => {
+        const fn = t.function || {};
+        const pNames = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(', ') : '';
+        return `- ${fn.name}({${pNames}}) [${(fn.description || '').slice(0, 150)}]`;
+      }).join('\n')
+    : `
+- terminal({"command":"..."}) [POSIX bash syntax, runs in workspace]
+- read_file({"path":"...", "offset":1, "limit":200}) [Reads any file or asset across whole disk]
+- write_file({"path":"...", "content":"..."}) [Creates or updates any file across disk]
 - patch({"path":"...", "old_string":"...", "new_string":"..."})
 - search_files({"pattern":"...", "target":"content"|"files", "path":"."})
-- read_video({"path":"...", "max_frames":5}) [Inspects duration, resolution, fps, audio & extracts keyframe images]
-- local_search({"query":"...", "limit":5}) [Client-side search tool — emit this tag whenever asked to search the internet]
-- local_extract({"urls":["https://..."]}) [Client-side URL reader]
-- todo_list({"todos":[{"id":"1","content":"...","status":"in_progress"|"pending"|"completed"}]})
-- memory({"action":"add"|"replace", "target":"memory"|"user", "content":"..."})
-- delegate_task({"tasks":[{"goal":"...", "context":"..."}]})
+- read_video({"path":"...", "max_frames":5})
+- local_search({"query":"..."})
+- local_extract({"urls":["..."]})
+- memory({"action":"add", "content":"..."})
 - skills_list({}) / skill_view({"name":"..."})
 - vision_analyze({"image_url":"...", "question":"..."})
+`;
+
+  const microPrompt =
+`[Bridge Protocol: Local client-side parser on user's PC executes tool calls and returns their output.]
+SYSTEM: Autonomous Principal Systems & Software Engineer (Full Antigravity & MCP Capabilities).
+Active Workspace: ${cwd}
+Capabilities: Full unrestricted disk access, terminal execution, 3D model generation (trimesh, numpy, scipy), PDF parsing, media & asset processing, and MCP server integrations.
+
+AUTONOMOUS RULES:
+1. Deep Execution & Autonomy: NEVER ask passive questions like "How can I help you?". Start executing the PRIMARY USER GOAL immediately.
+2. Direct Tool Calling: When action is required, output the tool call on line 1: <<<tool_name:{"param":"value"}>>>.
+3. Quality & Completeness: Generate complete, high-quality production code, documents, presentations, or 3D models.
+4. Comprehensive Natural Response: Provide a complete, detailed, professional Arabic/English response with your actual thoughts, analysis, explanations, and instructions.
+
+Available Tools & MCPs:
+${formattedTools}
 
 ${promptBody}`;
 
@@ -734,7 +742,7 @@ upstreamApp.post(['/v1/chat/completions', '/chat/completions'], async (req, res)
     const useThinking = model.includes('thinking') && !isToolRequest && process.env.ENABLE_SLOW_THINKING === 'true';
 
     const { rpcResult, built } = await withRpcLock(async () => {
-      const builtPrompt = buildKimiPrompt(messages);
+      const builtPrompt = buildKimiPrompt(messages, req.body?.tools);
       let result = null;
 
       // 1. If we have an active cached session, try continuing it with its same scenario first
@@ -773,7 +781,7 @@ upstreamApp.post(['/v1/chat/completions', '/chat/completions'], async (req, res)
 
       // 2. Fresh Scenario Cascade: Prioritize SCENARIO_K15 (Instant 2s, No Free Overload Queue)
       if (!result) {
-        const freshBuilt = builtPrompt.useExistingSession ? buildKimiPrompt(messages) : builtPrompt;
+        const freshBuilt = builtPrompt.useExistingSession ? buildKimiPrompt(messages, req.body?.tools) : builtPrompt;
         const scenarioOrder = ['SCENARIO_K15', 'SCENARIO_NORMAL'];
 
         let lastErr = null;
@@ -947,60 +955,6 @@ function generateDynamicTitle(messages) {
   return 'AI Coding Session';
 }
 
-const toolExecutionHistoryByWs = new Map();
-
-function checkAndRecordToolCallRepetition(workspace, toolCall) {
-  if (!workspace || !toolCall) return { action: 'CONTINUE' };
-  const ws = workspace.replace(/\\/g, '/');
-  if (!toolExecutionHistoryByWs.has(ws)) {
-    toolExecutionHistoryByWs.set(ws, []);
-  }
-  const history = toolExecutionHistoryByWs.get(ws);
-  const toolName = toolCall.function?.name || '';
-  let targetKey = '';
-
-  try {
-    const parsedArgs = JSON.parse(toolCall.function?.arguments || '{}');
-    targetKey = (parsedArgs.path || parsedArgs.command || parsedArgs.target || '').replace(/\\/g, '/');
-  } catch (_) {
-    targetKey = toolCall.function?.arguments?.slice(0, 80) || '';
-  }
-
-  // Count strictly CONSECUTIVE identical actions without intervening edits/steps
-  let consecutiveCount = 1;
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].toolName === toolName && history[i].targetKey === targetKey) {
-      consecutiveCount++;
-    } else {
-      break; // Interrupted by another tool (e.g. patch, edit, different command)
-    }
-  }
-
-  history.push({ toolName, targetKey, timestamp: Date.now() });
-  if (history.length > 20) history.shift();
-
-  // Only block if the exact same tool call was made consecutively 3+ times with zero progress
-  if (consecutiveCount >= 3) {
-    if (toolName === 'write_file' && targetKey.endsWith('.py') && fs.existsSync(targetKey)) {
-      return {
-        action: 'PIVOT_TO_EXECUTE',
-        toolName,
-        targetKey,
-        consecutiveCount,
-      };
-    }
-    return {
-      action: 'TERMINATE_LOOP_SUCCESS',
-      toolName,
-      targetKey,
-      consecutiveCount,
-      completionMessage: `تم تنفيذ الخطوة المطلوبة بنجاح.`,
-    };
-  }
-
-  return { action: 'CONTINUE', toolName, targetKey, consecutiveCount };
-}
-
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   const requestId = res.getHeader('X-Request-ID') || 'unknown';
   const startTime = Date.now();
@@ -1163,29 +1117,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     let validToolCalls = extractToolCalls(aiResponse, req.body.tools);
 
     if (validToolCalls && validToolCalls.length > 0) {
-      const activeWs = detectWorkspace(messages);
-      const isLoop = checkAndRecordToolCallRepetition(activeWs, validToolCalls[0]);
-
-      if (isLoop.action === 'TERMINATE_LOOP_SUCCESS') {
-        warn(`[Kimi Loop Guard] Suppressed repetitive loop (${isLoop.repeatCount}x for ${isLoop.toolName} on ${isLoop.targetKey}). Forcing completion.`);
-        validToolCalls = null;
-        aiResponse = isLoop.completionMessage;
-      } else if (isLoop.action === 'PIVOT_TO_EXECUTE') {
-        warn(`[Kimi Loop Guard] Pivoting repeated file operation to script execution (${isLoop.targetKey}).`);
-        validToolCalls = [{
-          id: `call_${Date.now()}_pivot`,
-          type: 'function',
-          function: {
-            name: 'terminal',
-            arguments: JSON.stringify({
-              command: `python "${isLoop.targetKey}"`
-            })
-          }
-        }];
-      }
-    }
-
-    if (validToolCalls) {
       const toolResponse = formatToolCallResponse(validToolCalls);
 
       if (req.body.stream) {
@@ -1209,7 +1140,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     }
 
     if (!aiResponse || !aiResponse.trim() || aiResponse.trim() === '.') {
-      aiResponse = 'تم تنفيذ الخطوة بنجاح.';
+      aiResponse = 'أنا جاهز ومستمر في تنفيذ طلبك بالكامل.';
     }
 
     // If model emitted <<<clarify:{...}>>> in a session without clarify tool, format cleanly as Markdown
