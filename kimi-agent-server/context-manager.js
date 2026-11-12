@@ -2,7 +2,7 @@ import { getModelLimits } from './utils/model-limits.js';
 import { warn, info, error as logError } from './utils.js';
 
 export const MAX_CONTEXT_TOKENS = parseInt(process.env.MAX_CONTEXT_TOKENS, 10) || 80000;
-export const AUTO_SESSION_RESET = process.env.AUTO_SESSION_RESET !== 'false';
+export const AUTO_SESSION_RESET = process.env.AUTO_SESSION_RESET === 'true'; // Default disabled: preserve single continuous conversation
 export const RESET_KEEP_MESSAGES = parseInt(process.env.RESET_KEEP_MESSAGES, 10) || 3;
 export const CHARS_PER_TOKEN = 4;
 

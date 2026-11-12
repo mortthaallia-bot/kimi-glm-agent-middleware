@@ -390,19 +390,7 @@ function buildKimiPrompt(messages) {
   const cwd = detectWorkspace(msgs);
   setActiveProjectWorkspace(cwd);
 
-  if (activeSession.workspace && activeSession.workspace !== cwd) {
-    console.log(`[KimiUpstream] Project switch detected: ${activeSession.workspace} -> ${cwd}. Resetting session cache.`);
-    activeSession = {
-      chatId: null,
-      lastMsgId: null,
-      firstUserHash: null,
-      workspace: cwd,
-      scenario: 'SCENARIO_K15',
-      updatedAt: 0,
-    };
-  } else {
-    activeSession.workspace = cwd;
-  }
+  activeSession.workspace = cwd;
 
   const context = extractGoalAndContext(msgs);
   const primaryGoal = context.primaryGoal;
@@ -411,17 +399,29 @@ function buildKimiPrompt(messages) {
 
   const firstUserHash = crypto.createHash('md5').update(context.firstUserIntent || primaryGoal).digest('hex');
 
+  // Only reset session if user explicitly started a brand new conversation in Hermes Desktop
+  const isBrandNewChat = cleanMessages.length <= 2 && activeSession.firstUserHash && activeSession.firstUserHash !== firstUserHash;
+  if (isBrandNewChat) {
+    console.log(`[KimiUpstream] New conversation initiated by user. Resetting upstream session cache.`);
+    activeSession = {
+      chatId: null,
+      lastMsgId: null,
+      firstUserHash,
+      workspace: cwd,
+      scenario: 'SCENARIO_K15',
+      updatedAt: 0,
+    };
+  }
+
   // Rewrite literal `web_search` / `web_extract` to `local_search` / `local_extract` so Kimi's web UI "联网" filter never blocks it
   const lastText = (context.lastEvent || '')
     .replace(/\bweb_search\b/gi, 'local_search')
     .replace(/\bweb_extract\b/gi, 'local_extract');
 
   const isSameConversation =
-    activeSession.chatId &&
-    activeSession.lastMsgId &&
-    activeSession.firstUserHash === firstUserHash &&
-    activeSession.workspace === cwd &&
-    Date.now() - activeSession.updatedAt < 15 * 60 * 1000;
+    Boolean(activeSession.chatId) &&
+    Boolean(activeSession.lastMsgId) &&
+    activeSession.firstUserHash === firstUserHash;
 
   const isPptxGoal = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(primaryGoal);
   let pptxDirective = '';
@@ -433,7 +433,7 @@ function buildKimiPrompt(messages) {
 
     if (hasPptx) {
       pptxDirective = `\nSPECIAL DIRECTIVE (Task Completed):
-- The presentation file "${cwd}/presentation.pptx" has ALREADY been successfully generated on disk.
+- The presentation file "${cwd}/presentation.pptx" ALREADY exists on disk.
 - DO NOT call write_file, read_file, or terminal again.
 - DO NOT rewrite build_slides.py.
 - The PowerPoint task is finished. Immediately output your final completion message in Arabic/English summarizing the presentation and confirming it is ready at "${cwd}/presentation.pptx".`;
@@ -460,7 +460,12 @@ ${historySummary ? `RECENT PROGRESS:\n${historySummary}\n` : ''}
 LATEST EVENT / TOOL OUTPUT:
 ${lastText}
 ${pptxDirective}
-MANDATORY DIRECTIVE: You are an autonomous agent with the capabilities of Antigravity. NEVER ask passive questions like "How can I help you?". If a workspace is empty or a step finished, immediately issue the NEXT tool call on line 1 (e.g. <<<write_file:{...}>>> or <<<terminal:{...}>>>) to accomplish the PRIMARY USER GOAL.`;
+INSTRUCTION:
+Review the latest tool result above and execute the NEXT logical step to fulfill the PRIMARY USER GOAL.
+- DO NOT repeat, rewrite, or re-read files that have already succeeded. Move forward to the next step.
+- If a script has been written, execute it with terminal.
+- If the final output file (such as presentation.pptx) is ready, conclude immediately with a clear summary.
+- NEVER ask passive conversational questions like "How can I help you?". Output the next required tool call on line 1.`;
 
     return {
       promptText: followUpPrompt,
@@ -1034,7 +1039,7 @@ function checkAndRecordToolCallRepetition(workspace, toolCall) {
       toolName,
       targetKey,
       repeatCount,
-      completionMessage: 'تم إنهاء العملية لتجنب التكرار. المهمة منجزة بنجاح.',
+      completionMessage: 'تم إيقاف تكرار الأمر لتوفير التوكنات، يرجى كتابة الخطوة التالية للمتابعة.',
     };
   }
 
@@ -1121,22 +1126,13 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
 
     let messagesToProcess = messages;
 
-    // Check pre-request token threshold & auto-reset if needed
+    // Check pre-request token threshold & auto-reset if explicitly enabled
     if (AUTO_SESSION_RESET) {
       const overflowStatus = isContextOverflow(incomingEstimatedTokens, model);
       if (overflowStatus.isOverflow) {
-        warn(`[Context Guard] Request estimated tokens (~${incomingEstimatedTokens}) exceeds safety threshold (${overflowStatus.safeThreshold} / max ${overflowStatus.maxLimit}). Triggering automatic session reset.`);
+        warn(`[Context Guard] Request estimated tokens (~${incomingEstimatedTokens}) exceeds safety threshold (${overflowStatus.safeThreshold} / max ${overflowStatus.maxLimit}). Compressing context history.`);
         const resetResult = buildCompressedSession(messagesToProcess, model);
         messagesToProcess = resetResult.messages;
-        // Reset upstream session state cache so fresh conversation starts cleanly
-        activeSession = {
-          chatId: null,
-          lastMsgId: null,
-          firstUserHash: null,
-          workspace: activeSession.workspace,
-          scenario: 'SCENARIO_K15',
-          updatedAt: 0,
-        };
       }
     }
 
