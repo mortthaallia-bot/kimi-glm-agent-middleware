@@ -67,12 +67,8 @@ export function validateRequestBody(body) {
     };
   }
 
-  const estimatedInputTokens = Math.ceil(JSON.stringify(messages).length / 3.5);
-  const totalContextError = validateTotalContext(estimatedInputTokens, body.max_tokens, model);
-  if (totalContextError) {
-    return { error: totalContextError, status: 400 };
-  }
-
+  // Context limits are enforced AFTER Observation Masking & Session Compression in server.js
+  // so long client trajectories (e.g. 130k raw tokens) are safely compressed instead of 400-rejected.
   return null;
 }
 

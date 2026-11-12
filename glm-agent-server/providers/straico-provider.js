@@ -4,6 +4,7 @@ import { BaseProvider } from './base-provider.js';
 import { injectToolsIntoSystem } from '../tools.js';
 import { formatChatCompletionResponse } from '../utils.js';
 import { summarizeIfNeeded } from '../summarizer.js';
+import { compressConversationHistory, compressToolMetadata } from '../prompt-optimizer.js';
 
 const httpsAgent = new Agent({
   keepAlive: true,
@@ -41,12 +42,13 @@ export class StraicoProvider extends BaseProvider {
     const { messages, model, tools, isToolRequest, ...otherParams } = openAIRequest;
 
     const useSmartSelector = !model || model === 'auto';
-    let processedMessages = injectToolsIntoSystem(messages, tools);
+    const maskedMessages = compressConversationHistory(messages);
+    let processedMessages = injectToolsIntoSystem(maskedMessages, tools);
 
     const summarizationResult = await summarizeIfNeeded(processedMessages, model);
     processedMessages = summarizationResult.messages;
 
-    const toolResultMaxLength = parseInt(process.env.TOOL_RESULT_MAX_LENGTH) || 8000;
+    const toolResultMaxLength = parseInt(process.env.TOOL_RESULT_MAX_LENGTH) || 10000;
     const hasToolResultLimit = !isNaN(toolResultMaxLength) && toolResultMaxLength > 0;
 
     if (isToolRequest) {
@@ -66,7 +68,7 @@ export class StraicoProvider extends BaseProvider {
 
           enhancedMessages.push({
             role: 'user',
-            content: `Tool output:\n${trimmed}\n\nNext step (use <<<tool_name:{"param":"value"}>>> if calling a tool, or reply to user):`
+            content: `Tool output:\n${trimmed}\n\nNext: <<<tool_name:{"param":"value"}>>> or final response.`
           });
           continue;
         }
@@ -87,16 +89,20 @@ export class StraicoProvider extends BaseProvider {
       }
     }
 
+    const compactTools = compressToolMetadata(tools);
+
     if (useSmartSelector) {
       return {
         model: 'glm-5.2',
-        messages: processedMessages
+        messages: processedMessages,
+        tools: compactTools,
       };
     }
 
     const straicoRequest = {
       model: model,
-      messages: processedMessages
+      messages: processedMessages,
+      tools: compactTools,
     };
 
     if (otherParams.temperature !== undefined) {

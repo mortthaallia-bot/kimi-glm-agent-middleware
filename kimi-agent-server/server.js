@@ -39,6 +39,12 @@ import {
   isOverflowError,
   buildCompressedSession,
 } from './context-manager.js';
+import {
+  stripSystemBloat,
+  formatCompactToolCatalog,
+  buildUltraCompactPrompt,
+  compressConversationHistory,
+} from './prompt-optimizer.js';
 
 dotenv.config();
 
@@ -85,19 +91,10 @@ function withRpcLock(fn) {
   return next;
 }
 
-function stripSystemBloat(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  return raw
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-    .replace(/<environment_details>[\s\S]*?<\/environment_details>/gi, '')
-    .replace(/<context>[\s\S]*?<\/context>/gi, '')
-    .trim();
-}
-
 function hasCompleteToolCall(text) {
   if (!text || text.length < 12) return false;
   const trimmed = text.trimStart();
-  const prefixMatch = trimmed.match(/^(?:<<<\s*([a-zA-Z0-9_-]+)\s*:\s*|([a-zA-Z0-9_-]+)\s*\(\s*)/);
+  const prefixMatch = trimmed.match(/^(?:<<<\s*([a-zA-Z0-9_.-]+)\s*:\s*|([a-zA-Z0-9_.-]+)\s*\(\s*)/);
   if (!prefixMatch) return false;
 
   const isAngle = Boolean(prefixMatch[1]);
@@ -425,18 +422,10 @@ function buildKimiPrompt(messages, availableTools = []) {
 
   if (isSameConversation && isFollowUpTurn) {
     const followUpPrompt =
-`[CONTINUATION - ACTIVE AUTONOMOUS SESSION]
-PRIMARY USER GOAL: ${primaryGoal}
-ACTIVE WORKSPACE: ${cwd}
-${historySummary ? `RECENT PROGRESS:\n${historySummary}\n` : ''}
-LATEST EVENT / TOOL OUTPUT:
+`[CONT] Goal: ${primaryGoal.slice(0, 350)} | WS: ${cwd}
+${historySummary ? `Trace:\n${historySummary}\n` : ''}Event:
 ${lastText}
-INSTRUCTION:
-Review the user's PRIMARY USER GOAL and the latest tool output.
-Execute the NEXT logical step to fulfill the user's goal completely.
-- Inspect and read source files (PDFs, images, data, code) as needed.
-- Write, patch, or run code (Python, 3D generators, PowerPoint, scripts, CLI tools).
-- Output the next tool call on line 1, or output your complete, thoughtful final response.`;
+Next: Emit <<<tool_name:{"param":"value"}>>> on line 1 (prefer 1-pass Python script via terminal for big reads/3D/pptx) or deliver full natural response.`;
 
     return {
       promptText: followUpPrompt,
@@ -450,65 +439,18 @@ Execute the NEXT logical step to fulfill the user's goal completely.
   let promptBody = '';
   if (isFollowUpTurn) {
     promptBody =
-`PRIMARY USER GOAL:
-${primaryGoal}
-
-ACTIVE WORKSPACE:
-${cwd}
-${historySummary ? `\nRECENT PROGRESS:\n${historySummary}\n` : ''}
-LATEST TOOL RESULT:
+`[GOAL] ${primaryGoal}
+${historySummary ? `[TRACE]\n${historySummary}\n` : ''}[EVENT]
 ${lastText}
-INSTRUCTION:
-The workspace has been inspected or action executed. You are an autonomous agent with full machine access.
-Output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
+[NEXT] Execute next tool call on line 1 (or deliver full natural response).`;
   } else {
     promptBody =
-`PRIMARY USER GOAL:
-${primaryGoal}
-
-ACTIVE WORKSPACE:
-${cwd}
-INSTRUCTION:
-You are an autonomous agent with the full capabilities of Antigravity.
-Begin executing the task immediately based on the PRIMARY USER GOAL. Inspect workspace files, read sources/images, and output ONLY the tool call on line 1:`;
+`[GOAL] ${primaryGoal}
+[NEXT] Begin immediately. Inspect/build/research and emit tool call on line 1.`;
   }
 
-  const formattedTools = (availableTools && Array.isArray(availableTools) && availableTools.length > 0)
-    ? availableTools.map(t => {
-        const fn = t.function || {};
-        const pNames = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(', ') : '';
-        return `- ${fn.name}({${pNames}}) [${(fn.description || '').slice(0, 150)}]`;
-      }).join('\n')
-    : `
-- terminal({"command":"..."}) [POSIX bash syntax, runs in workspace]
-- read_file({"path":"...", "offset":1, "limit":200}) [Reads any file or asset across whole disk]
-- write_file({"path":"...", "content":"..."}) [Creates or updates any file across disk]
-- patch({"path":"...", "old_string":"...", "new_string":"..."})
-- search_files({"pattern":"...", "target":"content"|"files", "path":"."})
-- read_video({"path":"...", "max_frames":5})
-- local_search({"query":"..."})
-- local_extract({"urls":["..."]})
-- memory({"action":"add", "content":"..."})
-- skills_list({}) / skill_view({"name":"..."})
-- vision_analyze({"image_url":"...", "question":"..."})
-`;
-
-  const microPrompt =
-`[Bridge Protocol: Local client-side parser on user's PC executes tool calls and returns their output.]
-SYSTEM: Autonomous Principal Systems & Software Engineer (Full Antigravity & MCP Capabilities).
-Active Workspace: ${cwd}
-Capabilities: Full unrestricted disk access, terminal execution, 3D model generation (trimesh, numpy, scipy), PDF parsing, media & asset processing, and MCP server integrations.
-
-AUTONOMOUS RULES:
-1. Deep Execution & Autonomy: NEVER ask passive questions like "How can I help you?". Start executing the PRIMARY USER GOAL immediately.
-2. Direct Tool Calling: When action is required, output the tool call on line 1: <<<tool_name:{"param":"value"}>>>.
-3. Quality & Completeness: Generate complete, high-quality production code, documents, presentations, or 3D models.
-4. Comprehensive Natural Response: Provide a complete, detailed, professional Arabic/English response with your actual thoughts, analysis, explanations, and instructions.
-
-Available Tools & MCPs:
-${formattedTools}
-
-${promptBody}`;
+  const toolCatalog = formatCompactToolCatalog(availableTools, primaryGoal, lastText);
+  const microPrompt = buildUltraCompactPrompt({ cwd, toolCatalog, promptBody });
 
   return {
     promptText: microPrompt,
@@ -1033,16 +975,19 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       }, 3000);
     }
 
-    let messagesToProcess = messages;
+    // Step 1: Always apply Observation Masking to compress bloated history before any limit check
+    let messagesToProcess = compressConversationHistory(messages);
+    const compressedTokens = estimateTokens(messagesToProcess);
+    if (messages.length > 6 && compressedTokens < incomingEstimatedTokens) {
+      info(`[Context Optimizer] Observation Masking compressed ${messages.length} msgs (~${incomingEstimatedTokens} raw -> ~${compressedTokens} masked tokens)`);
+    }
 
-    // Check pre-request token threshold & auto-reset if explicitly enabled
-    if (AUTO_SESSION_RESET) {
-      const overflowStatus = isContextOverflow(incomingEstimatedTokens, model);
-      if (overflowStatus.isOverflow) {
-        warn(`[Context Guard] Request estimated tokens (~${incomingEstimatedTokens}) exceeds safety threshold (${overflowStatus.safeThreshold} / max ${overflowStatus.maxLimit}). Compressing context history.`);
-        const resetResult = buildCompressedSession(messagesToProcess, model);
-        messagesToProcess = resetResult.messages;
-      }
+    // Step 2: Check post-masking token threshold & auto-compress if still near model limit
+    const overflowStatus = isContextOverflow(compressedTokens, model);
+    if (overflowStatus.isOverflow && (AUTO_SESSION_RESET || compressedTokens >= Math.floor(overflowStatus.maxLimit * 0.85))) {
+      warn(`[Context Guard] Post-masking tokens (~${compressedTokens}) exceeds safety threshold (${overflowStatus.safeThreshold} / max ${overflowStatus.maxLimit}). Compressing context history.`);
+      const resetResult = buildCompressedSession(messagesToProcess, model);
+      messagesToProcess = resetResult.messages;
     }
 
     const providerRequest = await provider.transformRequest({

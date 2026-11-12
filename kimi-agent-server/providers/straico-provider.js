@@ -4,6 +4,7 @@ import { BaseProvider } from './base-provider.js';
 import { injectToolsIntoSystem } from '../tools.js';
 import { formatChatCompletionResponse } from '../utils.js';
 import { summarizeIfNeeded } from '../summarizer.js';
+import { compressConversationHistory, compressToolMetadata } from '../prompt-optimizer.js';
 
 const DEFAULT_KIMI_TOKEN = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhY2NvdW50IiwiYXVkIjpbImtpbWkuYWkiXSwiZXhwIjoxODAyMDE5MTUzLCJpYXQiOjE3OTQyNDMxNTMsImp0aSI6ImRib3Zra2I0bDlhOW8zMHRqNHMwIiwidHlwIjoicmVmcmVzaCIsImFwcF9pZCI6ImtpbWkiLCJzdWIiOiJkODJoNXZrbnZqNGpoa2Zka2FhZyIsImFic3RyYWN0X3VzZXJfaWQiOiJkODJoNXZjbnZqNGpoa2ZkanZrMCIsImRldmljZV9pZCI6Ijc3MDYyMTU2MDczNzIzNzU1NTQiLCJyZWdpb24iOiJvdmVyc2VhcyIsIm1lbWJlcnNoaXAiOnsibGV2ZWwiOjEwfSwiY29kZV9tZW1iZXJzaGlwIjp7ImxldmVsIjoxMH19.XCCpYFc0pr6HJa4Fv0heUXzeigR14aYi9w9FH3H9QcKvDrqr9g0r6QPLYsTPIIz750KkLTQ9EwZXXRDR2UUKQg';
 
@@ -43,12 +44,14 @@ export class StraicoProvider extends BaseProvider {
     const { messages, model, tools, isToolRequest, ...otherParams } = openAIRequest;
 
     const useSmartSelector = !model || model === 'auto';
-    let processedMessages = injectToolsIntoSystem(messages, tools);
+    // Apply Observation Masking first so massive 80+ turn histories shrink by ~85% before tool injection
+    const maskedMessages = compressConversationHistory(messages);
+    let processedMessages = injectToolsIntoSystem(maskedMessages, tools);
 
     const summarizationResult = await summarizeIfNeeded(processedMessages, model);
     processedMessages = summarizationResult.messages;
 
-    const toolResultMaxLength = parseInt(process.env.TOOL_RESULT_MAX_LENGTH, 10) || 8000;
+    const toolResultMaxLength = parseInt(process.env.TOOL_RESULT_MAX_LENGTH, 10) || 10000;
     const hasToolResultLimit = !isNaN(toolResultMaxLength) && toolResultMaxLength > 0;
 
     if (isToolRequest) {
@@ -68,7 +71,7 @@ export class StraicoProvider extends BaseProvider {
 
           enhancedMessages.push({
             role: 'user',
-            content: `Tool output:\n${trimmed}\n\nNext step (use <<<tool_name:{"param":"value"}>>> if calling a tool, or reply to user):`
+            content: `Tool output:\n${trimmed}\n\nNext: <<<tool_name:{"param":"value"}>>> or final response.`
           });
           continue;
         }
@@ -90,10 +93,12 @@ export class StraicoProvider extends BaseProvider {
     }
 
     const resolvedModel = useSmartSelector ? 'kimi-latest' : model;
+    const compactTools = compressToolMetadata(tools);
 
     const kimiRequest = {
       model: resolvedModel,
       messages: processedMessages,
+      tools: compactTools,
       isToolRequest: Boolean(isToolRequest),
     };
 

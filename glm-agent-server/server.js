@@ -39,6 +39,7 @@ import {
   isOverflowError,
   buildCompressedSession,
 } from './context-manager.js';
+import { compressConversationHistory } from './prompt-optimizer.js';
 
 dotenv.config();
 
@@ -216,14 +217,17 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       }, 3000);
     }
 
-    let messagesToProcess = messages;
-    if (AUTO_SESSION_RESET) {
-      const overflowStatus = isContextOverflow(incomingEstimatedTokens, model);
-      if (overflowStatus.isOverflow) {
-        warn(`[Context Guard] Request estimated tokens (~${incomingEstimatedTokens}) exceeds safety threshold. Auto-resetting session.`);
-        const resetResult = buildCompressedSession(messagesToProcess, model);
-        messagesToProcess = resetResult.messages;
-      }
+    let messagesToProcess = compressConversationHistory(messages);
+    const compressedTokens = estimateTokens(messagesToProcess);
+    if (messages.length > 6 && compressedTokens < incomingEstimatedTokens) {
+      info(`[GLM Context Optimizer] Observation Masking compressed ${messages.length} msgs (~${incomingEstimatedTokens} raw -> ~${compressedTokens} masked tokens)`);
+    }
+
+    const overflowStatus = isContextOverflow(compressedTokens, model);
+    if (overflowStatus.isOverflow && (AUTO_SESSION_RESET || compressedTokens >= Math.floor(overflowStatus.maxLimit * 0.85))) {
+      warn(`[Context Guard] Post-masking tokens (~${compressedTokens}) exceeds safety threshold. Auto-compressing session.`);
+      const resetResult = buildCompressedSession(messagesToProcess, model);
+      messagesToProcess = resetResult.messages;
     }
 
     const providerRequest = await provider.transformRequest({

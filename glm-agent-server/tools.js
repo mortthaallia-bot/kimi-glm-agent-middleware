@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { formatCompactToolCatalog, extractTextContent } from './prompt-optimizer.js';
 
 let activeProjectWorkspace = 'C:/Users/hhjksd';
 
@@ -124,41 +125,31 @@ export function injectToolsIntoSystem(messages, tools) {
     return normalizeMessages(messages);
   }
 
-  const toolInstruction = `SYSTEM: Autonomous Principal Systems & Software Engineer (Antigravity-Grade Agent).
-You are an autonomous pair programmer with full operational capabilities on this machine.
-AUTONOMOUS OPERATING RULES:
-1. Zero Passivity: NEVER ask passive questions like "How can I help you?", "The folder is empty, what should I do?", or "Should I proceed?". If a workspace is empty, that is the expected starting state — IMMEDIATELY proceed to create the project files, write the scripts, and complete the goal.
-2. Tool Execution Rule: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}). Do NOT write conversational greetings or commentary before the tool call.
-3. PowerPoint / Presentations (.pptx): When asked for PowerPoint, presentations, slides, or .pptx (عرض تقديمي / باوربوينت / شرائح), Python is installed with python-pptx ready. Write a complete Python script using python-pptx in the workspace that creates a professional, multi-slide presentation (Title, Agenda, detailed content slides with bullets, Conclusion) and run it via terminal to produce the .pptx file.
-4. Complete Production Artifacts: Write full, working implementations without placeholders or cuts.
-5. Task Completion: ONLY after the entire task is 100% completed, tested, and verified on disk, write a clear, professional Arabic/English final summary.
-Tools:
-- terminal({"command":"..."})
-- read_file({"path":"...", "offset":1, "limit":200})
-- write_file({"path":"...", "content":"..."})
-- patch({"path":"...", "old_string":"...", "new_string":"..."})
-- search_files({"pattern":"...", "target":"content"|"files", "path":"."})
-- web_search({"query":"...", "limit":5})
-- web_extract({"urls":["https://..."]})
-- read_video({"path":"...", "max_frames":5})
-- todo_list({"todos":[{"id":"1","content":"...","status":"in_progress"|"pending"|"completed"}]})
-- memory({"action":"add"|"replace", "target":"memory"|"user", "content":"..."})
-- delegate_task({"tasks":[{"goal":"...", "context":"..."}]})
-- skills_list({}) / skill_view({"name":"..."})
-- vision_analyze({"image_url":"...", "question":"..."})
-- clarify({"question":"...", "choices":["..."]})
-Rule: To use a tool, output the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}).`;
-
   const result = normalizeMessages(messages);
+  const firstUserMsg = result.find(m => m.role === 'user');
+  const lastMsg = result[result.length - 1];
+  const compactCatalog = formatCompactToolCatalog(
+    tools,
+    extractTextContent(firstUserMsg),
+    extractTextContent(lastMsg)
+  );
+
+  const toolInstruction = `[SYS] Autonomous Principal Engineer, Deep Researcher & 3D Technical Artist (full OS/FS/CLI/MCP access; Python 3D: trimesh,numpy,scipy; Docs: pypdf,python-pptx).
+[RULES] Act immediately; batch big reads/builds via 1 Python script in terminal instead of multi-turn read_file loops. Call tools on line 1 ONLY: <<<tool_name:{"param":"value"}>>>. Triangulate research; verify deliverables on disk; give natural Arabic/English final response.
+[TOOLS]
+${compactCatalog}`;
 
   const systemIndex = result.findIndex(m => m.role === 'system');
   if (systemIndex !== -1) {
     if (result[systemIndex].content.includes(TOOL_INJECTION_SENTINEL)) {
       return result;
     }
+    const baseSys = result[systemIndex].content.length > 1800
+      ? result[systemIndex].content.slice(0, 1800)
+      : result[systemIndex].content;
     result[systemIndex] = {
       role: 'system',
-      content: `${result[systemIndex].content}\n\n${toolInstruction}\n${TOOL_INJECTION_SENTINEL}`
+      content: `${baseSys}\n\n${toolInstruction}\n${TOOL_INJECTION_SENTINEL}`
     };
   } else {
     result.unshift({ role: 'system', content: `${toolInstruction}\n${TOOL_INJECTION_SENTINEL}` });
@@ -1012,15 +1003,22 @@ function safeParseToolJson(rawJsonStr) {
 function parseShorthandFormat(responseText, availableToolNames) {
   const toolCalls = [];
 
-  // 1. <<<tool_name:{"param":"value"}>>>
-  const shorthandMatches = responseText.matchAll(/<<<\s*([a-zA-Z0-9_.-]+)\s*:\s*(\{[\s\S]*?\})\s*>+/g);
-  for (const match of shorthandMatches) {
+  // 1. <<<tool_name:{"param":"value"}>>> (balanced braces handle nested JSON & MCP args reliably)
+  const shorthandPrefixRegex = /<<<\s*([a-zA-Z0-9_.-]+)\s*:\s*\{/g;
+  let shorthandMatch;
+  while ((shorthandMatch = shorthandPrefixRegex.exec(responseText)) !== null) {
     try {
-      const rawName = match[1];
-      const rawArgs = safeParseToolJson(match[2]);
+      const rawName = shorthandMatch[1];
+      const braceStart = responseText.indexOf('{', shorthandMatch.index);
+      const extracted = extractBalancedBraces(responseText, braceStart);
+      if (!extracted) continue;
+      const after = responseText.slice(extracted.endIndex);
+      if (!/^\s*>+/.test(after)) continue;
+      const rawArgs = safeParseToolJson(extracted.jsonStr);
       if (rawArgs) {
         const { name, args } = normalizeToolCallForHermes(rawName, rawArgs, availableToolNames);
         toolCalls.push(createToolCallObject(name, args, toolCalls.length));
+        shorthandPrefixRegex.lastIndex = extracted.endIndex;
       }
     } catch (e) {}
   }

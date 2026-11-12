@@ -14,7 +14,21 @@ let sessionInitialized = false;
 const queue = [];
 let processing = false;
 
-function buildUpstreamPrompt(messages) {
+function formatCompactToolsZai(availableTools) {
+  if (!Array.isArray(availableTools) || availableTools.length === 0) {
+    return 'CORE: terminal(command,workdir?) | read_file(path,offset?,limit?) | write_file(path,content) | patch(path,old_string,new_string) | search_files(pattern,target?,path?) | web_search(query,limit?) | web_extract(urls) | vision_analyze(image_url,question) | read_video(path,max_frames?) | memory(action,target,content) | delegate_task(tasks)';
+  }
+  return availableTools
+    .filter(t => t && (t.function?.name || t.name))
+    .map(t => {
+      const fn = t.function || t;
+      const props = fn.parameters?.properties ? Object.keys(fn.parameters.properties).slice(0, 5).join(',') : '';
+      return `${fn.name}(${props})`;
+    })
+    .join(' | ');
+}
+
+function buildUpstreamPrompt(messages, availableTools = []) {
   let cwd = 'C:/Users/hhjksd';
 
   for (const m of messages) {
@@ -36,31 +50,19 @@ function buildUpstreamPrompt(messages) {
 
   if (isToolResultTurn && sessionInitialized) {
     return {
-      promptText: lastText,
+      promptText: `${lastText}\nNext: Emit <<<tool_name:{"param":"value"}>>> on line 1 (prefer 1-pass Python script for big reads/3D/pptx) or final natural response.`,
       startNewChat: false
     };
   }
 
   sessionInitialized = true;
+  const compactTools = formatCompactToolsZai(availableTools);
   const microPrompt =
-`SYSTEM: Full-Capability Autonomous Coding & Research Agent. Default working directory (already active): ${cwd}
-Tools:
-- terminal({"command":"..."}) [POSIX bash syntax, forward slashes /, no cd needed for workspace]
-- read_file({"path":"...", "offset":1, "limit":200})
-- write_file({"path":"...", "content":"..."})
-- patch({"path":"...", "old_string":"...", "new_string":"..."})
-- search_files({"pattern":"...", "target":"content"|"files", "path":"."})
-- web_search({"query":"...", "limit":5})
-- web_extract({"urls":["https://..."]})
-- todo_list({"todos":[{"id":"1","content":"...","status":"in_progress"|"pending"|"completed"}]})
-- memory({"action":"add"|"replace", "target":"memory"|"user", "content":"..."})
-- delegate_task({"tasks":[{"goal":"...", "context":"..."}]})
-- skills_list({}) / skill_view({"name":"..."})
-- vision_analyze({"image_url":"...", "question":"..."})
-- clarify({"question":"...", "choices":["..."]})
-Rule: To use a tool, output ONLY valid JSON: <<<tool_name:{"param":"value"}>>> (never write "\\ " in JSON strings) without conversational text.
-
-User: ${lastText}`;
+`[SYS] Autonomous Principal Engineer, Deep Researcher & 3D Artist (full OS/CLI/MCP access; Python 3D: trimesh,numpy,scipy; Docs: pypdf,python-pptx).
+[WS] ${cwd}
+[RULES] Act immediately; batch large reads/3D/pptx in 1 Python script via terminal; call tools on line 1 ONLY: <<<tool_name:{"param":"value"}>>>.
+[TOOLS] ${compactTools}
+[GOAL] ${lastText}`;
 
   return {
     promptText: microPrompt,
@@ -140,7 +142,7 @@ async function processQueue() {
   processing = true;
   const item = queue.shift();
   try {
-    await handleCompletion(item.messages, item.res, item.model);
+    await handleCompletion(item.messages, item.res, item.model, item.tools);
   } catch (err) {
     console.error('[Z.ai Upstream] Request handling error:', err);
     if (!item.res.headersSent) {
@@ -153,8 +155,8 @@ async function processQueue() {
   }
 }
 
-async function handleCompletion(messages, res, requestedModel) {
-  const { promptText, startNewChat } = buildUpstreamPrompt(messages);
+async function handleCompletion(messages, res, requestedModel, availableTools = []) {
+  const { promptText, startNewChat } = buildUpstreamPrompt(messages, availableTools);
   const reqId = 'chatcmpl-' + crypto.randomUUID();
   const modelName = requestedModel || 'glm-5.2';
 
@@ -218,9 +220,9 @@ async function handleCompletion(messages, res, requestedModel) {
           finish_reason: 'stop'
         }],
         usage: {
-          prompt_tokens: promptText.length,
-          completion_tokens: finalText.length,
-          total_tokens: promptText.length + finalText.length
+          prompt_tokens: Math.ceil(promptText.length / 4),
+          completion_tokens: Math.ceil(finalText.length / 4),
+          total_tokens: Math.ceil((promptText.length + finalText.length) / 4)
         }
       }));
     }
@@ -318,6 +320,7 @@ const server = http.createServer((req, res) => {
         const payload = JSON.parse(body);
         const messages = payload.messages || [];
         const model = payload.model || 'glm-5.2';
+        const tools = payload.tools || [];
 
         if (!isReady) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -325,7 +328,7 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        queue.push({ messages, res, model });
+        queue.push({ messages, res, model, tools });
         processQueue();
       } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
