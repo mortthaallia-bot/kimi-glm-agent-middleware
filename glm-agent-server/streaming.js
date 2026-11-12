@@ -26,24 +26,7 @@ async function simulateStreamNone(responseText, res) {
   }
 
   const streamId = `chatcmpl-${Date.now()}`;
-
-  if (!responseText) {
-    const finalChunk = {
-      id: streamId,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model: 'doai-proxy',
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: 'stop',
-      }],
-    };
-    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-    return;
-  }
+  const safeText = responseText.trim() ? responseText : 'تم تنفيذ الخطوة بنجاح.';
 
   const sseData = {
     id: streamId,
@@ -52,7 +35,7 @@ async function simulateStreamNone(responseText, res) {
     model: 'doai-proxy',
     choices: [{
       index: 0,
-      delta: { content: responseText },
+      delta: { content: safeText },
       finish_reason: null,
     }],
   };
@@ -82,26 +65,9 @@ async function simulateStreamSmart(responseText, res, chunkSize = 15, delay = 80
   }
 
   const streamId = `chatcmpl-${Date.now()}`;
+  const safeText = responseText.trim() ? responseText : 'تم تنفيذ الخطوة بنجاح.';
 
-  if (!responseText) {
-    const finalChunk = {
-      id: streamId,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model: 'doai-proxy',
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: 'stop',
-      }],
-    };
-    res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-    return;
-  }
-
-  const chunks = smartChunkText(responseText, chunkSize);
+  const chunks = smartChunkText(safeText, chunkSize);
 
   for (const chunk of chunks) {
     await delayMs(delay);

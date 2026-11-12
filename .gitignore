@@ -1,15 +1,62 @@
 # Dependencies
 node_modules/
+.pnp
+.pnp.js
+
+# Testing and Coverage
+coverage/
+*.lcov
+
+# Production & Build outputs
+dist/
+build/
+out/
+.next/
+.cache/
+
+# Remotion build and cache outputs
+remotion/build/
+remotion/bundle/
+remotion/dist/
+.remotion/
+
+# Package manager lock files (agent should inspect package.json, not entire locks)
 package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
 
 # Environment variables & sensitive keys
 .env
-.env.local
-*.log
-logs/
+.env.*
+!.env.example
+*.pem
+*.key
 
-# Cache & Temporary files
-.video_frames/
-attachments/
+# Server logs and runtime data
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# OS and editor files
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Large media & attachments
+attachments/
+.video_frames/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.zip
+*.tar.*
+*.iso

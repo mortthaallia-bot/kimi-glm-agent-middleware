@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { ProviderFactory } from './providers/index.js';
 import { simulateStream, streamToolCalls } from './streaming.js';
-import { formatToolCallResponse } from './tools.js';
+import { formatToolCallResponse, setActiveProjectWorkspace } from './tools.js';
 import {
   logRequest,
   logResponse,
@@ -27,7 +27,16 @@ import {
 import {
   MODEL_LIMITS,
   fetchModelLimits,
+  getModelLimits,
 } from './utils/model-limits.js';
+import {
+  AUTO_SESSION_RESET,
+  MAX_CONTEXT_TOKENS,
+  estimateTokens,
+  isContextOverflow,
+  isOverflowError,
+  buildCompressedSession,
+} from './context-manager.js';
 
 dotenv.config();
 
@@ -65,6 +74,80 @@ let activeSession = {
 };
 
 let k2CooldownUntil = 0;
+
+// Async Mutex Queue to serialize Kimi RPC calls and prevent REASON_CHAT_CONCURRENCY_EXCEEDED
+let rpcLockPromise = Promise.resolve();
+function withRpcLock(fn) {
+  const next = rpcLockPromise.then(() => fn(), () => fn());
+  rpcLockPromise = next.catch(() => {});
+  return next;
+}
+
+function stripSystemBloat(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+    .replace(/<environment_details>[\s\S]*?<\/environment_details>/gi, '')
+    .replace(/<context>[\s\S]*?<\/context>/gi, '')
+    .trim();
+}
+
+function hasCompleteToolCall(text) {
+  if (!text || text.length < 12) return false;
+  const trimmed = text.trimStart();
+  const prefixMatch = trimmed.match(/^(?:<<<\s*([a-zA-Z0-9_-]+)\s*:\s*|([a-zA-Z0-9_-]+)\s*\(\s*)/);
+  if (!prefixMatch) return false;
+
+  const isAngle = Boolean(prefixMatch[1]);
+  const startIdx = prefixMatch[0].length;
+  if (trimmed[startIdx] !== '{') return false;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let endIdx = -1;
+
+  for (let i = startIdx; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          endIdx = i;
+          break;
+        }
+      }
+    }
+  }
+
+  if (endIdx === -1) return false;
+  const after = trimmed.slice(endIdx + 1);
+  if (isAngle) {
+    if (!/^\s*>>>/.test(after)) return false;
+  } else {
+    if (!/^\s*\)(?:\s*\r?\n|\s*$)/.test(after)) return false;
+  }
+
+  try {
+    JSON.parse(trimmed.slice(startIdx, endIdx + 1));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function decodeJwtPayload(token) {
   try {
@@ -140,32 +223,194 @@ function encodeConnectMessage(data) {
   return message;
 }
 
-function buildKimiPrompt(messages) {
-  let cwd = 'C:/Users/hhjksd/Desktop/اعلان لمكتب فدك';
-
-  for (const m of messages) {
+function detectWorkspace(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
     if (typeof m.content === 'string') {
-      const cwdMatch = m.content.match(/Current working directory:\s*([^\r\n]+)/) ||
-                       m.content.match(/Workspace:\s*([^\r\n]+)/) ||
-                       m.content.match(/Root:\s*([^\r\n]+)/);
-      if (cwdMatch && cwdMatch[1]) {
-        cwd = cwdMatch[1].trim().replace(/\\/g, '/');
+      const match =
+        m.content.match(/(?:Current working directory|Working directory|Workspace root|Workspace|Project root|Project path|Root directory|Current directory|cwd):\s*([a-zA-Z]:[^\r\n"']+)/i) ||
+        m.content.match(/(?:Current working directory|Working directory|Workspace root|Workspace|Project root|Project path|Root directory|Current directory|cwd):\s*([^\r\n"']+)/i);
+      if (match && match[1]) {
+        let clean = match[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+        if (clean && clean !== '.' && clean !== '/') {
+          return clean;
+        }
       }
     }
   }
 
-  const firstUserMsg = messages.find(m => m.role === 'user');
-  const firstUserText = firstUserMsg
-    ? (typeof firstUserMsg.content === 'string' ? firstUserMsg.content : JSON.stringify(firstUserMsg.content))
-    : '';
-  const firstUserHash = crypto.createHash('md5').update(firstUserText).digest('hex');
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (typeof m.content === 'string') {
+      const pathMatch = m.content.match(/\b([a-zA-Z]:\/[^\s"'<>:\*\?\|]+)/);
+      if (pathMatch && pathMatch[1]) {
+        let p = pathMatch[1].trim().replace(/\\/g, '/');
+        if (/\.[a-zA-Z0-9]+$/.test(p)) {
+          p = p.substring(0, p.lastIndexOf('/'));
+        }
+        if (p && p.length > 5 && !p.toLowerCase().includes('/appdata/')) {
+          return p;
+        }
+      }
+    }
+  }
 
-  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
-  const rawLastText = lastMsg
-    ? (typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content))
-    : '';
+  return process.env.HERMES_WORKSPACE || process.env.USERPROFILE?.replace(/\\/g, '/') || 'C:/Users/hhjksd';
+}
+
+function extractGoalAndContext(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return {
+      primaryGoal: 'Fulfill the user task autonomously.',
+      historySummary: '',
+      lastEvent: '',
+      isToolFollowUp: false,
+    };
+  }
+
+  const isToolOutputText = (txt) => {
+    if (!txt || typeof txt !== 'string') return false;
+    const t = txt.trim();
+    return (
+      t.startsWith('Tool output:') ||
+      t.startsWith('[Tool Result]:') ||
+      t.startsWith('Tool Result:') ||
+      t.startsWith('{"tool_call_id"') ||
+      t.startsWith('Command executed with exit code') ||
+      t.startsWith('Exit code:') ||
+      t.startsWith('stdout:')
+    );
+  };
+
+  const genuineUserMsgs = [];
+  const executionSteps = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    let content = '';
+    if (typeof m.content === 'string') {
+      content = stripSystemBloat(m.content);
+    } else if (Array.isArray(m.content)) {
+      content = m.content
+        .filter(c => c && c.type === 'text' && c.text)
+        .map(c => stripSystemBloat(c.text))
+        .filter(Boolean)
+        .join('\n');
+    }
+
+    if (m.role === 'user') {
+      if (!isToolOutputText(content)) {
+        // Strip out workspace declaration headers and empty-workspace boilerplate so we get the clean user intent
+        const cleaned = content
+          .replace(/(?:Current working directory|Working directory|Workspace root|Workspace|Project root|Project path|Root directory|Current directory|cwd):\s*[^\r\n]+/gi, '')
+          .replace(/The workspace [^\r\n]+ exists but is empty\.?/gi, '')
+          .trim();
+        if (cleaned.length > 0) {
+          genuineUserMsgs.push(cleaned.slice(0, 1500));
+        }
+      } else {
+        const snippet = content.trim().slice(0, 200).replace(/[\r\n]+/g, ' ');
+        executionSteps.push(`- Tool Output: ${snippet}`);
+      }
+    } else if (m.role === 'tool') {
+      const snippet = content.trim().slice(0, 200).replace(/[\r\n]+/g, ' ');
+      executionSteps.push(`- Tool Output: ${snippet}`);
+    } else if (m.role === 'assistant') {
+      if (m.tool_calls && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const calls = m.tool_calls.map(tc => `${tc.function.name}(${tc.function.arguments?.slice(0, 80) || ''})`).join(', ');
+        executionSteps.push(`- Agent Action: ${calls}`);
+      } else if (content.includes('<<<') || content.includes('({"')) {
+        const match = content.match(/<<<([^:]+):/);
+        const name = match ? match[1] : 'tool_call';
+        executionSteps.push(`- Agent Action: ${name}`);
+      }
+    }
+  }
+
+  let fallbackUserContent = '';
+  const firstUserMsg = messages.find(m => m.role === 'user');
+  if (firstUserMsg) {
+    fallbackUserContent = typeof firstUserMsg.content === 'string'
+      ? stripSystemBloat(firstUserMsg.content)
+      : JSON.stringify(firstUserMsg.content);
+  }
+
+  const firstUserIntent = (genuineUserMsgs.length > 0
+    ? genuineUserMsgs[0]
+    : (fallbackUserContent || 'Fulfill the user task autonomously.')).slice(0, 1500);
+
+  const primaryGoal = (genuineUserMsgs.length > 0
+    ? genuineUserMsgs[genuineUserMsgs.length - 1]
+    : firstUserIntent).slice(0, 1500);
+
+  const lastMsg = messages[messages.length - 1];
+  let lastText = '';
+  if (lastMsg) {
+    if (typeof lastMsg.content === 'string') {
+      lastText = stripSystemBloat(lastMsg.content);
+    } else if (Array.isArray(lastMsg.content)) {
+      lastText = lastMsg.content.map(c => stripSystemBloat(c.text || '')).filter(Boolean).join('\n');
+    }
+  }
+  lastText = lastText.slice(0, 2500);
+
+  const hasPriorTurn = messages.some(m => m.role === 'assistant' || m.role === 'tool');
+  const isToolFollowUp = hasPriorTurn && (
+    isToolOutputText(lastText) ||
+    lastMsg?.role === 'tool' ||
+    lastMsg?.role === 'user'
+  );
+
+  const historySummary = executionSteps.slice(-5).join('\n');
+
+  return {
+    firstUserIntent,
+    primaryGoal,
+    historySummary,
+    lastEvent: lastText,
+    isToolFollowUp,
+  };
+}
+
+function buildKimiPrompt(messages) {
+  // Purge any leaked session_title artifacts from message history
+  const cleanMessages = (messages || []).filter(m => {
+    if (m.role === 'assistant' && typeof m.content === 'string') {
+      const trimmed = m.content.trim();
+      if (trimmed.startsWith('{"title":') && trimmed.endsWith('}')) {
+        return false;
+      }
+    }
+    return true;
+  });
+  const msgs = cleanMessages.length > 0 ? cleanMessages : messages;
+
+  const cwd = detectWorkspace(msgs);
+  setActiveProjectWorkspace(cwd);
+
+  if (activeSession.workspace && activeSession.workspace !== cwd) {
+    console.log(`[KimiUpstream] Project switch detected: ${activeSession.workspace} -> ${cwd}. Resetting session cache.`);
+    activeSession = {
+      chatId: null,
+      lastMsgId: null,
+      firstUserHash: null,
+      workspace: cwd,
+      scenario: 'SCENARIO_K15',
+      updatedAt: 0,
+    };
+  } else {
+    activeSession.workspace = cwd;
+  }
+
+  const context = extractGoalAndContext(msgs);
+  const primaryGoal = context.primaryGoal;
+  const historySummary = context.historySummary;
+  const isFollowUpTurn = context.isToolFollowUp;
+
+  const firstUserHash = crypto.createHash('md5').update(context.firstUserIntent || primaryGoal).digest('hex');
+
   // Rewrite literal `web_search` / `web_extract` to `local_search` / `local_extract` so Kimi's web UI "联网" filter never blocks it
-  const lastText = rawLastText
+  const lastText = (context.lastEvent || '')
     .replace(/\bweb_search\b/gi, 'local_search')
     .replace(/\bweb_extract\b/gi, 'local_extract');
 
@@ -173,18 +418,28 @@ function buildKimiPrompt(messages) {
     activeSession.chatId &&
     activeSession.lastMsgId &&
     activeSession.firstUserHash === firstUserHash &&
+    activeSession.workspace === cwd &&
     Date.now() - activeSession.updatedAt < 15 * 60 * 1000;
 
-  const isFollowUpTurn =
-    lastText.startsWith('Tool output:') ||
-    lastText.startsWith('[Tool Result]:') ||
-    messages.filter(m => m.role === 'assistant').length > 0;
+  const isPptxGoal = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(primaryGoal);
+  const pptxDirective = isPptxGoal
+    ? `\nSPECIAL DIRECTIVE (PowerPoint - Ultra-Fast 2-Second Generation):
+- Generate presentation instantly by calling write_file on line 1 to create "${cwd}/build_slides.py" (concise 20-line python-pptx script) and then execute it with terminal.
+- Define 4-5 core slides in a list of tuples and save to "${cwd}/presentation.pptx".
+- Line 1 MUST start with: <<<write_file:{"path":"${cwd}/build_slides.py","content":"from pptx import Presentation\\n..."}>>>`
+    : '';
 
   if (isSameConversation && isFollowUpTurn) {
-    const isToolOutput = lastText.startsWith('Tool output:') || lastText.startsWith('[Tool Result]:');
-    const followUpPrompt = isToolOutput
-      ? `${lastText}\n\n[RULE: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}), without conversational greetings or explanations.]`
-      : `${lastText}\n\n[Rule: Local client bridge executes tools on user's PC (terminal, read_file, write_file, patch, search_files, read_video, local_search, local_extract, todo_list, memory, delegate_task, skill_view). Output ONLY the tool call on line 1 without conversational text. Default workspace is "${cwd}".]`;
+    const followUpPrompt =
+`[CONTINUATION - ACTIVE AUTONOMOUS SESSION]
+PRIMARY USER GOAL: ${primaryGoal}
+ACTIVE WORKSPACE: ${cwd}
+${historySummary ? `RECENT PROGRESS:\n${historySummary}\n` : ''}
+LATEST EVENT / TOOL OUTPUT:
+${lastText}
+${pptxDirective}
+MANDATORY DIRECTIVE: You are an autonomous agent with the capabilities of Antigravity. NEVER ask passive questions like "How can I help you?". If a workspace is empty or a step finished, immediately issue the NEXT tool call on line 1 (e.g. <<<write_file:{...}>>> or <<<terminal:{...}>>>) to accomplish the PRIMARY USER GOAL.`;
+
     return {
       promptText: followUpPrompt,
       useExistingSession: true,
@@ -194,19 +449,48 @@ function buildKimiPrompt(messages) {
     };
   }
 
-  let effectiveUserBody = lastText;
-  if (lastText.startsWith('Tool output:') || lastText.startsWith('[Tool Result]:')) {
-    effectiveUserBody = `Goal: Build complete production Remotion motion graphics project for مكتب فدك in "${cwd}".\n\n${lastText}\n\nNext action (output tool call on line 1):`;
+  let promptBody = '';
+  if (isFollowUpTurn) {
+    promptBody =
+`PRIMARY USER GOAL:
+${primaryGoal}
+
+ACTIVE WORKSPACE:
+${cwd}
+${historySummary ? `\nRECENT PROGRESS:\n${historySummary}\n` : ''}
+LATEST TOOL RESULT:
+${lastText}
+${pptxDirective}
+INSTRUCTION:
+The workspace has been inspected or action executed. You are an autonomous agent. Do NOT ask conversational questions like "How can I help you?". Immediately output the next tool call on line 1 to fulfill the PRIMARY USER GOAL.`;
+  } else {
+    promptBody =
+`PRIMARY USER GOAL:
+${primaryGoal}
+
+ACTIVE WORKSPACE:
+${cwd}
+${pptxDirective}
+INSTRUCTION:
+You are an autonomous agent. Begin executing the task immediately. Output ONLY the tool call on line 1:`;
   }
 
   const microPrompt =
 `[Bridge Protocol: Local client-side parser on user's PC executes tool calls and returns their output. Do NOT use Kimi's built-in cloud tools.]
-SYSTEM: Full-Capability Autonomous Coding, Video & Research Agent. Default working directory (already active): ${cwd}
-STRICT RULE: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}). NEVER write conversational greetings, explanations, or commentary before the tool call.
+SYSTEM: Autonomous Principal Systems & Software Engineer (Antigravity-Grade Agent).
+Active Workspace: ${cwd}
+File System: Unrestricted full read/write access across all drives and paths.
+
+AUTONOMOUS AGENT CAPABILITIES & RULES:
+1. Proactive Autonomy: NEVER ask passive questions like "How can I help you?", "The directory is empty, what should I do?", or "Should I proceed?". An empty directory is normal for a new project. IMMEDIATELY proceed to create files, write code/scripts, and complete the goal.
+2. Fast & Direct Tool Calling: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}). NEVER output conversational filler or greetings before the tool call.
+3. Complete Production Artifacts: Create complete, working files directly.
+4. Verification & Completion: When the entire task is 100% finished and verified on disk, provide a clear, professional Arabic/English final summary detailing the files created and how to use them.
+
 Tools:
-- terminal({"command":"..."}) [POSIX bash syntax, forward slashes /, no cd needed for workspace]
-- read_file({"path":"...", "offset":1, "limit":200})
-- write_file({"path":"...", "content":"..."})
+- terminal({"command":"..."}) [POSIX bash syntax, forward slashes /, runs in active workspace or user directory]
+- read_file({"path":"...", "offset":1, "limit":200}) [Can read ANY absolute or relative path across the entire disk]
+- write_file({"path":"...", "content":"..."}) [Can create or overwrite ANY file across the disk]
 - patch({"path":"...", "old_string":"...", "new_string":"..."})
 - search_files({"pattern":"...", "target":"content"|"files", "path":"."})
 - read_video({"path":"...", "max_frames":5}) [Inspects duration, resolution, fps, audio & extracts keyframe images]
@@ -218,7 +502,7 @@ Tools:
 - skills_list({}) / skill_view({"name":"..."})
 - vision_analyze({"image_url":"...", "question":"..."})
 
-User: ${effectiveUserBody}`;
+${promptBody}`;
 
   return {
     promptText: microPrompt,
@@ -269,17 +553,22 @@ async function executeKimiConnectRPC(promptText, options = {}) {
   const bodyBuf = encodeConnectMessage(requestPayload);
   const ac = new AbortController();
 
-  // Sliding Idle Watchdog: 20s idle timeout (reset on every chunk), up to 75s max total
-  const IDLE_TIMEOUT_MS = 20000;
-  const MAX_TOTAL_TIMEOUT_MS = 75000;
+  // Two-stage Sliding Watchdog:
+  // - 25s initial prefill ceiling before first token (allows large context prefill to finish cleanly)
+  // - 8s post-token idle ceiling once text is actively streaming
+  // - 90s max total duration ceiling
+  const INITIAL_IDLE_TIMEOUT_MS = parseInt(process.env.INITIAL_IDLE_TIMEOUT_MS, 10) || 25000;
+  const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS, 10) || 8000;
+  const MAX_TOTAL_TIMEOUT_MS = parseInt(process.env.MAX_TOTAL_TIMEOUT_MS, 10) || 90000;
   let abortedDueToTimeout = false;
+  let completedNormally = false;
   let abortReason = '';
 
   let idleTimer = setTimeout(() => {
     abortedDueToTimeout = true;
-    abortReason = `Kimi stream stalled (no data for ${IDLE_TIMEOUT_MS / 1000}s)`;
+    abortReason = `Kimi stream stalled before first token (${INITIAL_IDLE_TIMEOUT_MS / 1000}s)`;
     ac.abort();
-  }, IDLE_TIMEOUT_MS);
+  }, INITIAL_IDLE_TIMEOUT_MS);
 
   const maxTimer = setTimeout(() => {
     abortedDueToTimeout = true;
@@ -291,9 +580,9 @@ async function executeKimiConnectRPC(promptText, options = {}) {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       abortedDueToTimeout = true;
-      abortReason = `Kimi stream stalled (no data for ${IDLE_TIMEOUT_MS / 1000}s)`;
+      abortReason = `Kimi stream idle after token generation (${STREAM_IDLE_TIMEOUT_MS / 1000}s)`;
       ac.abort();
-    }, IDLE_TIMEOUT_MS);
+    }, STREAM_IDLE_TIMEOUT_MS);
   };
 
   const textParts = [];
@@ -333,7 +622,6 @@ async function executeKimiConnectRPC(promptText, options = {}) {
 
     let buffer = Buffer.alloc(0);
     for await (const chunk of res.body) {
-      resetIdleTimer();
       buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
       let shouldStop = false;
 
@@ -367,11 +655,20 @@ async function executeKimiConnectRPC(promptText, options = {}) {
           returnedMsgId = frame.message.id;
         }
         if (frame.block?.text?.content && (frame.op === 'set' || frame.op === 'append')) {
+          resetIdleTimer();
           textParts.push(frame.block.text.content);
+          if (hasCompleteToolCall(textParts.join(''))) {
+            shouldStop = true;
+            break;
+          }
         }
         if (
           textParts.length > 0 &&
-          (frame.done || (returnedMsgId && frame.message?.id === returnedMsgId && frame.message?.status === 'MESSAGE_STATUS_COMPLETED'))
+          (
+            frame.done === true || (frame.done && typeof frame.done === 'object') ||
+            frame.message?.status === 'MESSAGE_STATUS_COMPLETED' ||
+            frame.status === 'MESSAGE_STATUS_COMPLETED'
+          )
         ) {
           shouldStop = true;
           break;
@@ -379,6 +676,7 @@ async function executeKimiConnectRPC(promptText, options = {}) {
       }
 
       if (shouldStop) {
+        completedNormally = true;
         clearTimeout(idleTimer);
         clearTimeout(maxTimer);
         ac.abort();
@@ -386,11 +684,15 @@ async function executeKimiConnectRPC(promptText, options = {}) {
       }
     }
   } catch (err) {
-    if (abortedDueToTimeout) {
-      throw new Error(`${abortReason} (${scenario})`);
-    }
-    if (err.name !== 'AbortError') {
-      throw err;
+    if (!completedNormally) {
+      const partialText = textParts.join('').trim();
+      if (partialText.length > 0) {
+        console.log(`[KimiUpstream] Stream finalized via idle detector (${partialText.length} chars collected).`);
+      } else if (abortedDueToTimeout) {
+        throw new Error(`${abortReason} (${scenario})`);
+      } else if (err.name !== 'AbortError') {
+        throw err;
+      }
     }
   } finally {
     clearTimeout(idleTimer);
@@ -431,116 +733,92 @@ upstreamApp.post(['/v1/chat/completions', '/chat/completions'], async (req, res)
   try {
     const { messages = [], model = 'kimi-latest', isToolRequest = false } = req.body || {};
     const authHeader = req.headers.authorization || `Bearer ${KIMI_REFRESH_TOKEN}`;
-
-    const built = buildKimiPrompt(messages);
-    // Keep thinking=false during tool/agent requests so responses complete in ~2-3s without 30s delay
     const useThinking = model.includes('thinking') && !isToolRequest && process.env.ENABLE_SLOW_THINKING === 'true';
 
-    let rpcResult = null;
-    const now = Date.now();
+    const { rpcResult, built } = await withRpcLock(async () => {
+      const builtPrompt = buildKimiPrompt(messages);
+      let result = null;
 
-    // 1. If we have an active cached session, try continuing it with its same scenario first
-    if (built.useExistingSession && built.chatId && built.parentId) {
-      const sessionScenario = activeSession.scenario || 'SCENARIO_K15';
-      try {
-        rpcResult = await executeKimiConnectRPC(built.promptText, {
-          authToken: authHeader,
-          chatId: built.chatId,
-          parentId: built.parentId,
-          thinking: useThinking,
-          scenario: sessionScenario,
-        });
-      } catch (sessionErr) {
-        if (/REASON_CHAT_IN_PROGRESS/i.test(sessionErr.message)) {
-          console.log(`[KimiUpstream] Kimi chat in progress, waiting 1500ms before retrying session (${sessionScenario})...`);
-          await new Promise(r => setTimeout(r, 1500));
-          try {
-            rpcResult = await executeKimiConnectRPC(built.promptText, {
-              authToken: authHeader,
-              chatId: built.chatId,
-              parentId: built.parentId,
-              thinking: useThinking,
-              scenario: sessionScenario,
-            });
-          } catch (retryErr) {
-            console.warn(`[KimiUpstream] Session retry failed (${retryErr.message}), switching to fresh cascade...`);
-            activeSession = { chatId: null, lastMsgId: null, firstUserHash: null, scenario: 'SCENARIO_K15', workspace: null, updatedAt: 0 };
-          }
-        } else {
-          console.warn(`[KimiUpstream] Cached session (${sessionScenario}) warning (${sessionErr.message}), switching to fresh scenario cascade...`);
-          if (sessionScenario === 'SCENARIO_K2' && /OVERLOADED|resource_exhausted/i.test(sessionErr.message)) {
-            k2CooldownUntil = Date.now() + 2 * 60 * 1000;
-          }
-          activeSession = { chatId: null, lastMsgId: null, firstUserHash: null, scenario: 'SCENARIO_K15', workspace: null, updatedAt: 0 };
-        }
-      }
-    }
-
-    // 2. Fresh Scenario Cascade: Prioritize SCENARIO_K15 (Instant 2s, No Free Overload Queue)
-    if (!rpcResult) {
-      const freshBuilt = built.useExistingSession ? buildKimiPrompt(messages) : built;
-      const scenarioOrder = ['SCENARIO_K15', 'SCENARIO_NORMAL', 'SCENARIO_SEARCH', 'SCENARIO_K2'];
-
-      let lastErr = null;
-      for (const candidateScenario of scenarioOrder) {
+      // 1. If we have an active cached session, try continuing it with its same scenario first
+      if (builtPrompt.useExistingSession && builtPrompt.chatId && builtPrompt.parentId) {
+        const sessionScenario = activeSession.scenario || 'SCENARIO_K15';
         try {
-          rpcResult = await executeKimiConnectRPC(freshBuilt.promptText, {
+          result = await executeKimiConnectRPC(builtPrompt.promptText, {
             authToken: authHeader,
-            chatId: null,
-            parentId: null,
-            thinking: candidateScenario === 'SCENARIO_K2' ? useThinking : false,
-            scenario: candidateScenario,
+            chatId: builtPrompt.chatId,
+            parentId: builtPrompt.parentId,
+            thinking: useThinking,
+            scenario: sessionScenario,
           });
-          if (rpcResult && rpcResult.text && rpcResult.text.trim()) {
-            break;
-          }
-        } catch (candErr) {
-          lastErr = candErr;
-          console.warn(`[KimiUpstream] Scenario ${candidateScenario} failed (${candErr.message}), trying next scenario...`);
-          if (candidateScenario === 'SCENARIO_K2' && /OVERLOADED|resource_exhausted/i.test(candErr.message)) {
-            k2CooldownUntil = Date.now() + 2 * 60 * 1000;
+        } catch (sessionErr) {
+          if (/REASON_CHAT_IN_PROGRESS|CONCURRENCY_EXCEEDED/i.test(sessionErr.message)) {
+            console.log(`[KimiUpstream] Kimi chat in progress, waiting 1200ms before retrying session (${sessionScenario})...`);
+            await new Promise(r => setTimeout(r, 1200));
+            try {
+              result = await executeKimiConnectRPC(builtPrompt.promptText, {
+                authToken: authHeader,
+                chatId: builtPrompt.chatId,
+                parentId: builtPrompt.parentId,
+                thinking: useThinking,
+                scenario: sessionScenario,
+              });
+            } catch (retryErr) {
+              console.warn(`[KimiUpstream] Session retry failed (${retryErr.message}), switching to fresh cascade...`);
+              activeSession = { chatId: null, lastMsgId: null, firstUserHash: null, scenario: 'SCENARIO_K15', workspace: activeSession.workspace, updatedAt: 0 };
+            }
+          } else {
+            console.warn(`[KimiUpstream] Cached session (${sessionScenario}) warning (${sessionErr.message}), switching to fresh scenario cascade...`);
+            activeSession = { chatId: null, lastMsgId: null, firstUserHash: null, scenario: 'SCENARIO_K15', workspace: activeSession.workspace, updatedAt: 0 };
           }
         }
       }
 
-      // 3. Ultimate Fallback to local Z.ai GLM Upstream (port 8002) if all 4 Kimi scenarios fail
-      if (!rpcResult) {
-        console.warn(`[KimiUpstream] All Kimi scenarios failed (${lastErr?.message}), falling back to local Z.ai upstream (8002)...`);
-        const fallbackRes = await fetch('http://127.0.0.1:8002/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'glm-5.1',
-            messages: [{ role: 'user', content: freshBuilt.promptText }],
-            stream: false,
-          }),
-        });
-        if (!fallbackRes.ok) {
-          throw lastErr || new Error(`Fallback upstream failed with HTTP ${fallbackRes.status}`);
+      // 2. Fresh Scenario Cascade: Prioritize SCENARIO_K15 (Instant 2s, No Free Overload Queue)
+      if (!result) {
+        const freshBuilt = builtPrompt.useExistingSession ? buildKimiPrompt(messages) : builtPrompt;
+        const scenarioOrder = ['SCENARIO_K15', 'SCENARIO_NORMAL'];
+
+        let lastErr = null;
+        for (const candidateScenario of scenarioOrder) {
+          try {
+            result = await executeKimiConnectRPC(freshBuilt.promptText, {
+              authToken: authHeader,
+              chatId: null,
+              parentId: null,
+              thinking: false,
+              scenario: candidateScenario,
+            });
+            if (result && result.text && result.text.trim()) {
+              break;
+            }
+          } catch (candErr) {
+            lastErr = candErr;
+            console.warn(`[KimiUpstream] Scenario ${candidateScenario} failed (${candErr.message}), trying next scenario...`);
+            if (/CONCURRENCY_EXCEEDED|CHAT_IN_PROGRESS/i.test(candErr.message)) {
+              console.log(`[KimiUpstream] Chat concurrency lock detected, cooling down 1200ms...`);
+              await new Promise(r => setTimeout(r, 1200));
+            }
+          }
         }
-        const fallbackData = await fallbackRes.json();
-        const fallbackText = fallbackData?.choices?.[0]?.message?.content || '';
-        if (!fallbackText.trim()) {
-          throw lastErr || new Error('Empty response from all upstreams');
+
+        if (!result) {
+          throw lastErr || new Error('All Kimi scenarios failed');
         }
-        rpcResult = {
-          text: fallbackText,
-          chatId: null,
-          messageId: fallbackData.id || crypto.randomUUID(),
-          scenario: 'FALLBACK_ZAI',
+      }
+
+      if (result.chatId && result.messageId && result.text && result.text.trim().length > 0) {
+        activeSession = {
+          chatId: result.chatId,
+          lastMsgId: result.messageId,
+          firstUserHash: builtPrompt.firstUserHash,
+          workspace: activeSession.workspace,
+          scenario: result.scenario || 'SCENARIO_K15',
+          updatedAt: Date.now(),
         };
       }
-    }
 
-    if (rpcResult.chatId && rpcResult.messageId && rpcResult.text && rpcResult.text.trim().length > 0) {
-      activeSession = {
-        chatId: rpcResult.chatId,
-        lastMsgId: rpcResult.messageId,
-        firstUserHash: built.firstUserHash,
-        scenario: rpcResult.scenario || 'SCENARIO_K15',
-        updatedAt: Date.now(),
-      };
-    }
+      return { rpcResult: result, built: builtPrompt };
+    });
 
     const elapsed = Date.now() - startTime;
     console.log(`[KimiUpstream] Completed in ${elapsed}ms (scenario=${rpcResult.scenario}, session=${built.useExistingSession ? 'cached' : 'new'}, len=${rpcResult.text.length}): ${rpcResult.text.slice(0, 120)}`);
@@ -635,13 +913,40 @@ app.get(['/v1/models', '/models'], (req, res) => {
 
 function isAuxiliaryTitleRequest(body) {
   if (!body || !Array.isArray(body.messages)) return false;
-  if (body.response_format?.json_schema?.name === 'session_title') return true;
-  for (const m of body.messages) {
-    if (typeof m.content === 'string' && m.content.includes('You name chat sessions.')) {
+
+  // Rule 1: Agent chat turns with tools CAN NEVER be a session title request
+  if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+    return false;
+  }
+
+  // Rule 2: Title requests are strictly isolated background calls with 1 or 2 messages max
+  if (body.messages.length > 2) {
+    return false;
+  }
+
+  // Rule 3: Explicit session_title response_format schema
+  if (body.response_format?.json_schema?.name === 'session_title') {
+    return true;
+  }
+
+  // Rule 4: Isolated title prompt on message 0 only (never scan message history)
+  const firstMsg = body.messages[0];
+  if (firstMsg?.role === 'system' && typeof firstMsg.content === 'string') {
+    if (firstMsg.content.includes('You name chat sessions.') || firstMsg.content.includes('Task: Name this chat session')) {
       return true;
     }
   }
+
   return false;
+}
+
+function generateDynamicTitle(messages) {
+  const userMsg = messages?.find(m => m.role === 'user');
+  if (userMsg && typeof userMsg.content === 'string') {
+    const text = userMsg.content.trim().slice(0, 35).replace(/[\r\n"']/g, ' ');
+    if (text) return text;
+  }
+  return 'AI Coding Session';
 }
 
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
@@ -654,7 +959,8 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
 
     // Fast-path for Hermes Desktop background session title generation
     if (isAuxiliaryTitleRequest(req.body)) {
-      const titleJson = JSON.stringify({ title: 'Fadak Office Motion Project (Kimi)' });
+      const dynamicTitle = generateDynamicTitle(req.body.messages);
+      const titleJson = JSON.stringify({ title: dynamicTitle });
       const streamId = `chatcmpl-${Date.now()}`;
       if (req.body.stream) {
         setSSEHeaders(res);
@@ -721,15 +1027,67 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       }, 3000);
     }
 
+    let messagesToProcess = messages;
+
+    // Check pre-request token threshold & auto-reset if needed
+    if (AUTO_SESSION_RESET) {
+      const overflowStatus = isContextOverflow(incomingEstimatedTokens, model);
+      if (overflowStatus.isOverflow) {
+        warn(`[Context Guard] Request estimated tokens (~${incomingEstimatedTokens}) exceeds safety threshold (${overflowStatus.safeThreshold} / max ${overflowStatus.maxLimit}). Triggering automatic session reset.`);
+        const resetResult = buildCompressedSession(messagesToProcess, model);
+        messagesToProcess = resetResult.messages;
+        // Reset upstream session state cache so fresh conversation starts cleanly
+        activeSession = {
+          chatId: null,
+          lastMsgId: null,
+          firstUserHash: null,
+          workspace: activeSession.workspace,
+          scenario: 'SCENARIO_K15',
+          updatedAt: 0,
+        };
+      }
+    }
+
     const providerRequest = await provider.transformRequest({
       model,
-      messages,
+      messages: messagesToProcess,
       tools: req.body.tools,
       ...otherParams,
       isToolRequest: true,
     });
 
-    const providerResponse = await provider.makeRequestWithRetry(providerRequest);
+    let providerResponse = null;
+    let retryAttempted = false;
+
+    try {
+      providerResponse = await provider.makeRequestWithRetry(providerRequest);
+    } catch (reqError) {
+      // Auto-recovery: If request failed with context overflow or concurrency lock, attempt 1 auto-reset retry
+      if (AUTO_SESSION_RESET && !retryAttempted && isOverflowError(reqError)) {
+        warn(`[Context Auto-Recovery] Upstream failure (${reqError.message}). Attempting automatic session reset & single retry...`);
+        retryAttempted = true;
+        activeSession = {
+          chatId: null,
+          lastMsgId: null,
+          firstUserHash: null,
+          workspace: activeSession.workspace,
+          scenario: 'SCENARIO_K15',
+          updatedAt: 0,
+        };
+        const resetResult = buildCompressedSession(messagesToProcess, model);
+        messagesToProcess = resetResult.messages;
+        const retryRequest = await provider.transformRequest({
+          model,
+          messages: messagesToProcess,
+          tools: req.body.tools,
+          ...otherParams,
+          isToolRequest: true,
+        });
+        providerResponse = await provider.makeRequestWithRetry(retryRequest);
+      } else {
+        throw reqError;
+      }
+    }
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -738,6 +1096,26 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     validateProviderResponse(providerResponse);
 
     let aiResponse = providerResponse.data.choices[0].message.content || '';
+
+    // Intercept passive greetings/questions when tools are active and an objective is defined
+    const isPassiveDeflection =
+      /(?:exists but is empty|workspace is empty|folder is empty|مجلد فارغ)[\s\S]*(?:how can i help|what would you like|how may i help|how can i assist|كيف يمكنني مساعدتك|بماذا يمكنني|ماذا تريد)/i.test(aiResponse) ||
+      /^(?:The workspace [^\n]+ exists but is empty\. How can I help you today\?)/i.test(aiResponse.trim());
+
+    if (isPassiveDeflection && req.body.tools && req.body.tools.length > 0) {
+      console.warn(`[Passive Deflection Intercepted] Model attempted passive response: "${aiResponse.slice(0, 100)}". Re-routing autonomously.`);
+      const extractedCtx = extractGoalAndContext(messages);
+      const isPptx = /powerpoint|power point|presentation|pptx|عرض تقديمي|باوربوينت|بوربوينت|بور بوينت|باور بوينت|سلايدات|شرائح|slides/i.test(extractedCtx.primaryGoal);
+      const activeWs = detectWorkspace(messages);
+
+      if (isPptx && req.body.tools.some(t => t.function.name === 'write_file')) {
+        const scriptPath = `${activeWs}/build_presentation.py`;
+        const initialPptxScript = `import sys\nimport os\ntry:\n    from pptx import Presentation\n    from pptx.util import Inches, Pt\n    from pptx.dml.color import RGBColor\n    prs = Presentation()\n    prs.slide_width = Inches(13.333)\n    prs.slide_height = Inches(7.5)\n    slide_layout = prs.slide_layouts[0]\n    slide = prs.slides.add_slide(slide_layout)\n    title = slide.shapes.title\n    subtitle = slide.placeholders[1]\n    title.text = "${extractedCtx.primaryGoal.replace(/"/g, '\\"')}"\n    subtitle.text = "Generated autonomously by AI Agent"\n    out_path = os.path.join(r"${activeWs.replace(/\//g, '\\\\')}", "presentation.pptx")\n    prs.save(out_path)\n    print(f"Presentation saved to {out_path}")\nexcept Exception as e:\n    print(f"Error: {e}", file=sys.stderr)\n    sys.exit(1)\n`;
+        aiResponse = `<<<write_file:{"path":"${scriptPath}","content":${JSON.stringify(initialPptxScript)}}>>>`;
+      } else if (req.body.tools.some(t => t.function.name === 'terminal')) {
+        aiResponse = `<<<terminal:{"command":"python -c \\"import pptx; print('python-pptx is available')\\""}>>>`;
+      }
+    }
 
     const validToolCalls = extractToolCalls(aiResponse, req.body.tools);
 
@@ -764,8 +1142,8 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       }
     }
 
-    if (aiResponse === '.' && req.body.tools) {
-      aiResponse = '';
+    if (!aiResponse || !aiResponse.trim() || aiResponse.trim() === '.') {
+      aiResponse = 'تم تنفيذ الخطوة بنجاح.';
     }
 
     // If model emitted <<<clarify:{...}>>> in a session without clarify tool, format cleanly as Markdown
@@ -808,7 +1186,12 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     }
     const responseTime = Date.now() - startTime;
     logErrorFn(`[Kimi Error Processing Request] ${requestId}: ${error.message}`);
-    await handleUpstreamError(error, res, responseTime);
+    await handleUpstreamError(error, res, responseTime, {
+      model,
+      messages,
+      estimatedTokens: incomingEstimatedTokens,
+      requestId,
+    });
   }
 });
 

@@ -7,10 +7,35 @@ let fetchPromise = null;
 
 /**
  * Model limits cache
- * Stores full model information fetched from Straico API
+ * Stores full model information fetched from Straico API or fallback defaults
  * Format: { modelId: { max_output, word_limit, name, model_type, metadata } }
  */
-export let MODEL_LIMITS = {};
+export let MODEL_LIMITS = {
+  'kimi-latest': {
+    max_output: 8192,
+    word_limit: 128000,
+    name: 'Kimi Latest',
+    model_type: 'chat',
+  },
+  'kimi-k2-thinking': {
+    max_output: 8192,
+    word_limit: 128000,
+    name: 'Kimi K2 Thinking',
+    model_type: 'chat',
+  },
+  'glm-5.3': {
+    max_output: 8192,
+    word_limit: 128000,
+    name: 'GLM-5.3',
+    model_type: 'chat',
+  },
+  'glm-5.2': {
+    max_output: 8192,
+    word_limit: 128000,
+    name: 'GLM-5.2',
+    model_type: 'chat',
+  },
+};
 
 /**
  * Fetch model limits from Straico v2 API

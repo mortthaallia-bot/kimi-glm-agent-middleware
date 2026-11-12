@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Agent Ignore Configuration for Hermes Desktop & Middleware Guards",
+  "version": "1.0.0",
+  "maxFileSizeBytes": 204800,
+  "maxReadLines": 150,
+  "maxSearchMatches": 50,
+  "ignoredDirectories": [
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".cache",
+    "coverage",
+    ".remotion",
+    "remotion/build",
+    "remotion/bundle",
+    "remotion/dist",
+    "attachments",
+    ".video_frames",
+    "logs"
+  ],
+  "ignoredFiles": [
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb"
+  ],
+  "ignoredExtensions": [
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".zip", ".tar", ".gz", ".7z",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+    ".mp3", ".wav", ".ogg", ".aac", ".flac"
+  ]
+}

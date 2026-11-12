@@ -15,7 +15,7 @@ const queue = [];
 let processing = false;
 
 function buildUpstreamPrompt(messages) {
-  let cwd = 'C:/Users/hhjksd/Desktop/اعلان لمكتب فدك';
+  let cwd = 'C:/Users/hhjksd';
 
   for (const m of messages) {
     if (typeof m.content === 'string') {

@@ -1,6 +1,94 @@
 import fs from 'fs';
 import path from 'path';
 
+let activeProjectWorkspace = 'C:/Users/hhjksd';
+
+// ============================================================================
+// AGENT RESTRICTIONS & TOOL GUARDRAILS (Protect Context & Prevent 500 Overflows)
+// ============================================================================
+
+export const MAX_FILE_READ_SIZE_KB = parseInt(process.env.MAX_FILE_READ_SIZE_KB, 10) || 200;
+export const MAX_READ_LINES = parseInt(process.env.MAX_READ_LINES, 10) || 150;
+export const MAX_SEARCH_MATCHES = parseInt(process.env.MAX_SEARCH_MATCHES, 10) || 50;
+
+export const BLOCKED_PATH_PATTERNS = [
+  /(?:^|[\\/])node_modules(?:[\\/]|$)/i,
+  /(?:^|[\\/])\.git(?:[\\/]|$)/i,
+  /(?:^|[\\/])(?:dist|build|out|\.next|\.cache|coverage)(?:[\\/]|$)/i,
+  /(?:^|[\\/])\.remotion(?:[\\/]|$)/i,
+  /(?:^|[\\/])remotion[\\/](?:build|bundle|dist|out)(?:[\\/]|$)/i,
+  /(?:^|[\\/])(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb)$/i,
+  /\.(?:exe|dll|so|dylib|bin|iso|zip|tar|gz|7z)$/i,
+  /\.(?:mp4|mov|avi|mkv|webm|flv|wmv)$/i,
+  /\.(?:jpg|jpeg|png|gif|webp|svg|ico)$/i,
+  /\.(?:mp3|wav|ogg|aac|flac)$/i,
+];
+
+export function isPathBlocked(filePath) {
+  if (!filePath || typeof filePath !== 'string') return { blocked: false };
+  const normalized = filePath.replace(/\\/g, '/');
+
+  for (const pattern of BLOCKED_PATH_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return {
+        blocked: true,
+        reason: `Access to '${filePath}' is blocked by middleware guardrails (matches rule: ${pattern.toString()}). Inspect package.json or source directories instead.`
+      };
+    }
+  }
+  return { blocked: false };
+}
+
+export function inspectFileForSafeRead(filePath, requestedOffset = 1, requestedLimit = 200) {
+  const blockCheck = isPathBlocked(filePath);
+  if (blockCheck.blocked) {
+    return {
+      allowed: false,
+      reason: blockCheck.reason,
+    };
+  }
+
+  try {
+    if (fs.existsSync(filePath)) {
+      const stats = fs.statSync(filePath);
+      const sizeKb = stats.size / 1024;
+      if (stats.isDirectory()) {
+        return {
+          allowed: false,
+          reason: `Target path '${filePath}' is a directory, not a file. Use search_files({"path":"${filePath}", "target":"files"}) instead.`
+        };
+      }
+      if (sizeKb > MAX_FILE_READ_SIZE_KB) {
+        return {
+          allowed: true,
+          oversized: true,
+          sizeKb: Math.round(sizeKb),
+          safeOffset: requestedOffset || 1,
+          safeLimit: Math.min(requestedLimit || MAX_READ_LINES, MAX_READ_LINES),
+          notice: `[NOTICE: File size (${Math.round(sizeKb)} KB) exceeds safety threshold (${MAX_FILE_READ_SIZE_KB} KB). Reading capped to ${MAX_READ_LINES} lines from line ${requestedOffset || 1}. Use specific offset/limit range for deeper sections.]`
+        };
+      }
+    }
+  } catch (_) {}
+
+  return {
+    allowed: true,
+    oversized: false,
+    safeOffset: requestedOffset || 1,
+    safeLimit: Math.min(requestedLimit || 200, 300),
+  };
+}
+
+export function setActiveProjectWorkspace(ws) {
+  if (ws && typeof ws === 'string') {
+    activeProjectWorkspace = ws.trim().replace(/\\/g, '/');
+  }
+}
+
+export function getActiveProjectWorkspace() {
+  return activeProjectWorkspace;
+}
+
 const TOOL_INJECTION_SENTINEL = '<!-- proxy-tools-injected -->';
 
 const CORE_PRIORITY_TOOLS = new Set([
@@ -39,7 +127,14 @@ export function injectToolsIntoSystem(messages, tools) {
     return normalizeMessages(messages);
   }
 
-  const toolInstruction = `SYSTEM: Full-Capability Autonomous Coding & Research Agent.
+  const toolInstruction = `SYSTEM: Autonomous Principal Systems & Software Engineer (Antigravity-Grade Agent).
+You are an autonomous pair programmer with full operational capabilities on this machine.
+AUTONOMOUS OPERATING RULES:
+1. Zero Passivity: NEVER ask passive questions like "How can I help you?", "The folder is empty, what should I do?", or "Should I proceed?". If a workspace is empty, that is the expected starting state — IMMEDIATELY proceed to create the project files, write the scripts, and complete the goal.
+2. Tool Execution Rule: Output ONLY the tool call on line 1, e.g. <<<tool_name:{"param":"value"}>>> or tool_name({"param":"value"}). Do NOT write conversational greetings or commentary before the tool call.
+3. PowerPoint / Presentations (.pptx): When asked for PowerPoint, presentations, slides, or .pptx (عرض تقديمي / باوربوينت / شرائح), Python is installed with python-pptx ready. Write a complete Python script using python-pptx in the workspace that creates a professional, multi-slide presentation (Title, Agenda, detailed content slides with bullets, Conclusion) and run it via terminal to produce the .pptx file.
+4. Complete Production Artifacts: Write full, working implementations without placeholders or cuts.
+5. Task Completion: ONLY after the entire task is 100% completed, tested, and verified on disk, write a clear, professional Arabic/English final summary.
 Tools:
 - terminal({"command":"..."})
 - read_file({"path":"...", "offset":1, "limit":200})
@@ -183,8 +278,10 @@ export function sanitizeTerminalCommand(rawArgs) {
 
   if (args.workdir && typeof args.workdir === 'string') {
     args.workdir = normalizeWindowsOrMsysPath(args.workdir);
+  } else if (activeProjectWorkspace) {
+    args.workdir = normalizeWindowsOrMsysPath(activeProjectWorkspace);
   } else {
-    args.workdir = 'C:/Users/hhjksd/Desktop/اعلان لمكتب فدك';
+    args.workdir = 'C:/Users/hhjksd';
   }
 
   const bashPathPrefix = 'export PATH="/c/Users/hhjksd/AppData/Local/hermes/tools/ffmpeg:/c/Users/hhjksd/AppData/Local/hermes/tools/python-3.14.9+20261021-win32-x64:/c/Users/hhjksd/AppData/Local/hermes/tools/git-2.56.0-win32-x64/bin:/c/Users/hhjksd/AppData/Local/hermes/tools/git-2.56.0-win32-x64/usr/bin:/c/Users/hhjksd/AppData/Local/hermes/git/mingw64/bin:/c/Users/hhjksd/AppData/Local/hermes/git/usr/bin:/c/Users/hhjksd/AppData/Local/hermes/git/bin:/c/Users/hhjksd/AppData/Local/hermes/tools/node-26.12.1-win32-x64:/c/Users/hhjksd/AppData/Local/hermes/tools/npm-12.0.2-win32-x64/bin:/c/Users/hhjksd/AppData/Local/hermes/tools:$PATH"; ';
@@ -237,6 +334,39 @@ export function normalizeToolCallForHermes(toolName, rawArgs, availableToolNames
     }
     if (args.path && typeof args.path === 'string') {
       args.path = normalizeWindowsOrMsysPath(args.path);
+
+      // Check if path is blocked (node_modules, .git, lockfiles, build caches)
+      const blockCheck = isPathBlocked(args.path);
+      if (blockCheck.blocked) {
+        if (hasTool('terminal')) {
+          // Re-route safely to terminal echo warning rather than letting agent crash context
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${blockCheck.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      // Safe size inspection
+      const readSafety = inspectFileForSafeRead(args.path, args.offset, args.limit);
+      if (!readSafety.allowed) {
+        if (hasTool('terminal')) {
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${readSafety.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      if (readSafety.oversized) {
+        args.offset = readSafety.safeOffset;
+        args.limit = readSafety.safeLimit;
+      }
+
       try {
         const parentDir = path.dirname(args.path);
         if (parentDir && !fs.existsSync(parentDir)) {
@@ -263,6 +393,39 @@ export function normalizeToolCallForHermes(toolName, rawArgs, availableToolNames
     }
     if (args.path && typeof args.path === 'string') {
       args.path = normalizeWindowsOrMsysPath(args.path);
+
+      // Check if path is blocked (node_modules, .git, lockfiles, build caches)
+      const blockCheck = isPathBlocked(args.path);
+      if (blockCheck.blocked) {
+        if (hasTool('terminal')) {
+          // Re-route safely to terminal echo warning rather than letting agent crash context
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${blockCheck.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      // Safe size inspection
+      const readSafety = inspectFileForSafeRead(args.path, args.offset, args.limit);
+      if (!readSafety.allowed) {
+        if (hasTool('terminal')) {
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${readSafety.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      if (readSafety.oversized) {
+        args.offset = readSafety.safeOffset;
+        args.limit = readSafety.safeLimit;
+      }
+
       try {
         const parentDir = path.dirname(args.path);
         if (parentDir && !fs.existsSync(parentDir)) {
@@ -290,6 +453,39 @@ export function normalizeToolCallForHermes(toolName, rawArgs, availableToolNames
     }
     if (args.path && typeof args.path === 'string') {
       args.path = normalizeWindowsOrMsysPath(args.path);
+
+      // Check if path is blocked (node_modules, .git, lockfiles, build caches)
+      const blockCheck = isPathBlocked(args.path);
+      if (blockCheck.blocked) {
+        if (hasTool('terminal')) {
+          // Re-route safely to terminal echo warning rather than letting agent crash context
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${blockCheck.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      // Safe size inspection
+      const readSafety = inspectFileForSafeRead(args.path, args.offset, args.limit);
+      if (!readSafety.allowed) {
+        if (hasTool('terminal')) {
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${readSafety.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
+      if (readSafety.oversized) {
+        args.offset = readSafety.safeOffset;
+        args.limit = readSafety.safeLimit;
+      }
+
       try {
         const parentDir = path.dirname(args.path);
         if (parentDir && !fs.existsSync(parentDir)) {
@@ -334,6 +530,21 @@ export function normalizeToolCallForHermes(toolName, rawArgs, availableToolNames
     }
     if (args.path && typeof args.path === 'string') {
       args.path = normalizeWindowsOrMsysPath(args.path);
+
+      // Check if path is blocked (node_modules, .git, lockfiles, build caches)
+      const blockCheck = isPathBlocked(args.path);
+      if (blockCheck.blocked) {
+        if (hasTool('terminal')) {
+          // Re-route safely to terminal echo warning rather than letting agent crash context
+          return {
+            name: 'terminal',
+            args: {
+              command: `echo "[GUARDRAIL BLOCKED]: ${blockCheck.reason.replace(/"/g, '\\"')}"`
+            }
+          };
+        }
+      }
+
       try {
         const parentDir = path.dirname(args.path);
         if (parentDir && !fs.existsSync(parentDir)) {
@@ -345,6 +556,9 @@ export function normalizeToolCallForHermes(toolName, rawArgs, availableToolNames
       args.target = 'files';
     } else if (!args.target) {
       args.target = 'content';
+    }
+    if (!args.limit || Number(args.limit) > MAX_SEARCH_MATCHES) {
+      args.limit = MAX_SEARCH_MATCHES;
     }
   }
   // 7. Web Search (Research capability)

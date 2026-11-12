@@ -1,0 +1,37 @@
+# Hermes Agent Ignore Rules
+# Excluded from agent read_file, search_files, and tree traversal
+
+node_modules/
+.git/
+dist/
+build/
+out/
+.next/
+.cache/
+coverage/
+.remotion/
+remotion/build/
+remotion/bundle/
+remotion/dist/
+
+# Lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Logs & Binaries
+logs/
+*.log
+*.exe
+*.dll
+*.bin
+*.iso
+*.zip
+*.tar.*
+*.mp4
+*.mov
+*.webm
+*.png
+*.jpg
+*.jpeg
